@@ -34,5 +34,3 @@ actuar_conn = {
     'password': os.getenv("ACTUAR_CONN_PASSWORD"),
     'database': os.getenv("ACTUAR_CONN_DATABASE", default='Motor')
 }
-
-if __name__ == "__main__":
