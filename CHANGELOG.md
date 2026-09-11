@@ -7,7 +7,8 @@
 - Удалён неиспользуемый код: ipywidgets/кнопки, sociohub, matplotlib/requests, дубли импортов, закомментированные ветки GUI.
 - HTML: топ-20 групп; каждая группа бьётся на компоненты в `./output/html/group_{N}/{N}_{k}.html`.
 - Gephi: полные графы в `./output/gephi/Group_visualisation{N}.gexf` (без разбиения).
-- Перед `run()` старые HTML/Gephi удаляются.
+- Исправлен запуск в Jupyter: пакет `src/`, вызов `run_pipeline()` вместо `run()` (конфликт с IPython `%run`).
+- Перед `run_pipeline()` создаются `./vars`, `./output`, `./output/html`, `./output/gephi`; старые HTML/Gephi удаляются.
 - Визуализация: без physics/menu; title рёбер ≤ 3 убытков.
 - Выгрузка только `./output/statistics.xlsx`; колонки «ФИО участников группы» и «Номера убытков».
 - Ускорение `create_links` / `create_statistics` / индексы для viz; параллельное чтение Excel.

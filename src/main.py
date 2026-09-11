@@ -43,6 +43,12 @@ def clear_graph_outputs():
                 os.remove(full)
 
 
+def ensure_artifact_dirs():
+    """Создать папки для pickle/Excel/HTML/Gephi, если их ещё нет."""
+    for path in (VARS_DIR, OUTPUT_DIR, HTML_DIR, GEPHI_DIR):
+        os.makedirs(path, exist_ok=True)
+
+
 def _list_input_files():
     """Excel и SQL в рабочей папке — источники для отпечатка входа."""
     files = []
@@ -108,9 +114,16 @@ def try_load_cached_artifacts():
     return True, fingerprint
 
 
-def run():
-    """Пайплайн без GUI: кэш или полный пересчёт, затем визуализация и Gephi."""
+def run_pipeline():
+    """Пайплайн без GUI: кэш или полный пересчёт, затем визуализация и Gephi.
+
+    В Jupyter вызывайте ``run_pipeline()``, не ``run()``:
+    имя ``run`` пересекается с magic ``%run``.
+    """
+    ensure_artifact_dirs()
     clear_graph_outputs()
+    # clear_graph_outputs сносит html/gephi — восстановить пустые каталоги
+    ensure_artifact_dirs()
     cached, fingerprint = try_load_cached_artifacts()
     if not cached:
         print('Вход изменился или нет кэша — полный пересчёт...')
@@ -120,6 +133,10 @@ def run():
         _save_fingerprint(fingerprint)
         print('Отпечаток входа сохранён в ./vars/input_fingerprint.json')
     visualize()
+
+
+# Для скриптов; в ноутбуке используйте run_pipeline()
+run = run_pipeline
 
 
 def load():
@@ -464,6 +481,7 @@ def preprocessing():
     print('\tОбъекты сфомированы.')
     
     print('   Сохранение объектов...')
+    ensure_artifact_dirs()
     pickle.dump(data, open('./vars/data', 'wb'))  
     pickle.dump(people, open('./vars/people', 'wb'))  
     pickle.dump(VIN, open('./vars/VIN','wb'))  
@@ -542,6 +560,7 @@ def create_links():
     links = (pd.concat(parts, ignore_index=True)
              if parts else
              pd.DataFrame(columns=['obj1', 'obj2', 'Loss_idx', 'link_type']))
+    ensure_artifact_dirs()
     pickle.dump(links, open('./vars/links', 'wb'))
     print('\tСвязи созданы.')
     print('Готово ✅')
@@ -616,12 +635,12 @@ def create_statistics():
     stat['Плотность связей'] = stat['Число связей'] / stat['Число убытков']
     stat['Плотность убытков'] = stat['Число убытков'] / stat['Число объектов']
     
+    ensure_artifact_dirs()
     pickle.dump(G, open('./vars/G', 'wb'))
     pickle.dump(groups, open('./vars/groups', 'wb'))
     pickle.dump(stat, open('./vars/stat', 'wb'))
     pickle.dump(data, open('./vars/data', 'wb'))
 
-    os.makedirs('./output', exist_ok=True)
     with pd.ExcelWriter('./output/statistics.xlsx', engine='xlsxwriter') as writer:
         stat.to_excel(writer, index=False, sheet_name='statistics')
     print('./output/statistics.xlsx')
