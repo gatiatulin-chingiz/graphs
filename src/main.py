@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import pickle
 import shutil
@@ -27,36 +28,68 @@ def _hub_degree_n() -> int:
     return max(0, int(getattr(config, 'hub_degree_n', 0)))
 
 
-def _remove_legal_entities() -> bool:
-    return bool(getattr(config, 'remove_legal_entities', False))
+def _legal_forms_remove():
+    """Список форм/брендов из config; пустой = срез юрлиц выключен."""
+    forms = getattr(config, 'legal_forms_remove', None)
+    if forms is None:
+        # обратная совместимость со старым флагом
+        if getattr(config, 'remove_legal_entities', False):
+            return list(_DEFAULT_LEGAL_FORMS)
+        return []
+    return [str(x).strip() for x in forms if str(x).strip()]
 
 
-# Маркеры юрлиц в текстовой метке объекта (верхний регистр).
-_ORG_MARKERS = (
-    'ООО', 'АО"', 'АО «', 'АО ', '"АО', 'ПАО', 'СПАО', 'НАО', 'ЗАО', 'ОАО',
-    'АКЦИОНЕРН', 'ОБЩЕСТВО С ОГРАНИЧЕННОЙ', 'ЛИЗИНГ', 'СТРАХ', 'СОГАЗ',
-    'ИНГОССТРАХ', 'РЕСО', 'АЛЬФАСТРАХ', 'ГБУ', 'МБУ', 'ФГУП', 'ФКУ',
-    'КАРШЕРИНГ', 'ГОСУДАРСТВЕНН',
-)
+# Короткие ОПФ: ищем как отдельное «слово», чтобы «АО» не ловило внутри «ПАО» некорректно
+# (порядок проверки длинных форм — в самом списке config).
+_SHORT_OPF = {
+    'ООО', 'АО', 'ПАО', 'СПАО', 'НАО', 'ЗАО', 'ОАО',
+    'ГБУ', 'ГУП', 'МБУ', 'ФГУП', 'ФКУ', 'СК',
+}
+
+_DEFAULT_LEGAL_FORMS = [
+    'ООО', 'АО', 'ПАО', 'СПАО', 'НАО', 'ЗАО', 'ОАО',
+    'ГБУ', 'ГУП', 'МБУ', 'ФГУП', 'ФКУ',
+    'АКЦИОНЕРНОЕ ОБЩЕСТВО', 'ПУБЛИЧНОЕ АКЦИОНЕРНОЕ',
+    'ОБЩЕСТВО С ОГРАНИЧЕННОЙ', 'ГОСУДАРСТВЕННОЕ БЮДЖЕТНОЕ',
+    'ГОСУДАРСТВЕННОЕ УНИТАРНОЕ', 'ЛИЗИНГ', 'СТРАХ', 'ЮГОРИЯ',
+]
 
 
-def is_legal_entity_label(label) -> bool:
-    """Эвристика: метка похожа на организацию, а не на ФИО+ДР."""
+def _clean_entity_label(label) -> str:
     text = str(label).strip()
-    if not text or text.lower() in ('nan', 'none', 'nat'):
+    for bad in (' nan', ' NaT', ' None', ' NAN'):
+        if text.endswith(bad):
+            text = text[: -len(bad)].strip()
+    if text.lower() in ('nan', 'none', 'nat'):
+        return ''
+    return text
+
+
+def label_matches_legal_forms(label, forms) -> bool:
+    """True, если метка содержит хотя бы одну форму/бренд из списка."""
+    if not forms:
         return False
-    upper = text.upper()
-    if any(marker in upper for marker in _ORG_MARKERS):
-        return True
-    # «ФИО nan» / длинное имя без даты — часто юрлицо из people
-    parts = text.split()
-    if len(parts) >= 2 and parts[-1].lower() in ('nan', 'nat', 'none'):
-        body = ' '.join(parts[:-1]).upper()
-        if any(marker in body for marker in _ORG_MARKERS):
-            return True
-        if '"' in text or '«' in text or '»' in text:
+    upper = _clean_entity_label(label).upper()
+    if not upper:
+        return False
+    # Длинные формы раньше коротких — меньше сюрпризов при отладке
+    ordered = sorted({str(f).strip().upper() for f in forms if str(f).strip()}, key=len, reverse=True)
+    for form in ordered:
+        if form in _SHORT_OPF or (len(form) <= 4 and ' ' not in form):
+            if re.search(
+                rf'(?<![0-9A-ZА-ЯЁ]){re.escape(form)}(?![0-9A-ZА-ЯЁ])',
+                upper,
+            ):
+                return True
+        elif form in upper:
             return True
     return False
+
+
+def is_legal_entity_label(label, forms=None) -> bool:
+    """Юрлицо по списку forms (по умолчанию — legal_forms_remove или дефолтный каталог)."""
+    use = forms if forms is not None else (_legal_forms_remove() or _DEFAULT_LEGAL_FORMS)
+    return label_matches_legal_forms(label, use)
 
 
 VARS_DIR = './vars'
@@ -183,13 +216,18 @@ def run_pipeline():
     """Пайплайн: кэш или пересчёт → статистика/Gephi/HTML. Без GUI в ноутбуке.
 
     В Jupyter вызывайте ``run_pipeline()``, не ``run()`` (конфликт с ``%run``).
-    Рычаги: ``config.viz_top_n``, ``hub_degree_n``, ``remove_legal_entities``.
+    Рычаги: ``config.viz_top_n``, ``hub_degree_n``, ``legal_forms_remove``.
     """
     top_n = _viz_top_n()
+    forms = _legal_forms_remove()
     log('Пайплайн графов', level='header')
     log(f'viz_top_n = {top_n}', level='info')
     log(f'hub_degree_n = {_hub_degree_n()}', level='info')
-    log(f'remove_legal_entities = {_remove_legal_entities()}', level='info')
+    log(
+        f'legal_forms_remove = {len(forms)} шт.'
+        + (f' ({", ".join(forms[:6])}…)' if len(forms) > 6 else (f' ({", ".join(forms)})' if forms else ' (выкл.)')),
+        level='info',
+    )
     ensure_artifact_dirs()
     clear_graph_outputs()
     ensure_artifact_dirs()
@@ -248,30 +286,24 @@ def _subgraph_for_group(group_index: int = 0) -> nx.Graph:
 
 def degree_report(group_index: int = 0, top_n: int = 40):
     """
-    Таблицы для подбора hub_degree_n и флага remove_legal_entities.
+    Таблицы для подбора hub_degree_n и списка legal_forms_remove.
 
     Возвращает (summary, top_hubs, cut_scenarios, config_result).
-    config_result — итог при текущих значениях из config.py.
     """
     ensure_runtime_state()
     graph = _subgraph_for_group(group_index)
     people_count = len(people)
     objects_df = pd.DataFrame(objects)
+    forms_cfg = _legal_forms_remove()
+    forms_detect = forms_cfg or _DEFAULT_LEGAL_FORMS
 
     def _label(i):
         if i in objects_df.index:
             return str(objects_df.loc[i, 0])
         return str(i)
 
-    def _clean_label(raw: str) -> str:
-        text = str(raw).strip()
-        for bad in (' nan', ' NaT', ' None', ' nan'):
-            if text.endswith(bad):
-                text = text[: -len(bad)].strip()
-        return text
-
     def _node_kind(i, label: str) -> str:
-        if is_legal_entity_label(label):
+        if label_matches_legal_forms(label, forms_detect):
             return 'юрлицо'
         if i >= people_count:
             return 'VIN'
@@ -282,8 +314,17 @@ def degree_report(group_index: int = 0, top_n: int = 40):
         empty = pd.DataFrame()
         return empty, empty, empty, empty
 
-    labels = {i: _clean_label(_label(i)) for i in deg.index}
-    org_nodes = {i for i, lab in labels.items() if is_legal_entity_label(lab)}
+    labels = {i: _clean_entity_label(_label(i)) for i in deg.index}
+    org_nodes = {
+        i for i, lab in labels.items()
+        if label_matches_legal_forms(lab, forms_cfg if forms_cfg else forms_detect)
+    }
+    # для сценария «удалить» всегда режем по актуальному списку config,
+    # а если он пуст — по дефолтному каталогу (what-if)
+    org_remove_set = {
+        i for i, lab in labels.items()
+        if label_matches_legal_forms(lab, forms_cfg if forms_cfg else forms_detect)
+    }
 
     def _pct(p):
         return float(np.percentile(deg.to_numpy(), p))
@@ -300,7 +341,9 @@ def degree_report(group_index: int = 0, top_n: int = 40):
             ('узлов', int(graph.number_of_nodes())),
             ('рёбер', int(graph.number_of_edges())),
             ('компонент сейчас', int(n_cc_now)),
-            ('из них похожих на юрлица', int(len(org_nodes))),
+            ('совпало с legal_forms_remove', int(len(org_nodes)) if forms_cfg else 0),
+            ('совпало с каталогом (для отчёта)', int(len(org_remove_set))),
+            ('форм в config', int(len(forms_cfg))),
             ('degree min', int(deg.min())),
             ('degree median', round(float(deg.median()), 2)),
             ('degree mean', round(mean_d, 2)),
@@ -324,14 +367,18 @@ def degree_report(group_index: int = 0, top_n: int = 40):
     top_hubs['тип'] = [
         _node_kind(i, labels.get(i, '')) for i in top_hubs['obj_idx']
     ]
-    top_hubs = top_hubs[['obj_idx', 'degree', 'тип', 'метка']]
+    top_hubs['в_срезе'] = [
+        'удалить' if label_matches_legal_forms(labels.get(i, ''), forms_cfg)
+        else ('—' if not forms_cfg else 'оставить')
+        for i in top_hubs['obj_idx']
+    ]
+    top_hubs = top_hubs[['obj_idx', 'degree', 'тип', 'в_срезе', 'метка']]
 
     def _cut_stats(base_graph, remove_orgs: bool, degree_n: int):
-        """Срез → число компонент и размеры топ-компонент."""
         H = base_graph.copy()
         removed = 0
-        if remove_orgs and org_nodes:
-            drop = [n for n in org_nodes if n in H]
+        if remove_orgs and org_remove_set:
+            drop = [n for n in org_remove_set if n in H]
             H.remove_nodes_from(drop)
             removed += len(drop)
         if degree_n > 0 and H.number_of_nodes() > 0:
@@ -356,7 +403,7 @@ def degree_report(group_index: int = 0, top_n: int = 40):
 
     scenarios = []
     for name, thr in [
-        ('только юрлица', 0),
+        ('только юрлица из списка', 0),
         ('p90', p90),
         ('p95', p95),
         ('p99', p99),
@@ -367,13 +414,13 @@ def degree_report(group_index: int = 0, top_n: int = 40):
         ('degree>200', 200),
         ('config hub_degree_n', _hub_degree_n()),
     ]:
-        thr_i = int(np.floor(thr)) if name != 'только юрлица' else 0
-        for drop_orgs, org_tag in [(False, 'юрлица: оставить'), (True, 'юрлица: удалить')]:
-            if name == 'только юрлица' and not drop_orgs:
+        thr_i = int(np.floor(thr)) if name != 'только юрлица из списка' else 0
+        for drop_orgs, org_tag in [(False, 'список: не применять'), (True, 'список: удалить')]:
+            if name == 'только юрлица из списка' and not drop_orgs:
                 continue
             stats = _cut_stats(graph, remove_orgs=drop_orgs, degree_n=thr_i)
             scenarios.append({
-                'сценарий': name if name != 'только юрлица' else 'без порога N',
+                'сценарий': name if name != 'только юрлица из списка' else 'без порога N',
                 'юрлица': org_tag,
                 'порог N (degree > N)': thr_i,
                 **stats,
@@ -381,16 +428,39 @@ def degree_report(group_index: int = 0, top_n: int = 40):
     cut_scenarios = pd.DataFrame(scenarios)
 
     cfg_n = _hub_degree_n()
-    cfg_orgs = _remove_legal_entities()
-    cfg_stats = _cut_stats(graph, remove_orgs=cfg_orgs, degree_n=cfg_n)
+    # факт применения в пайплайне: только непустой legal_forms_remove
+    apply_orgs = bool(forms_cfg)
+    org_for_cfg = {
+        i for i, lab in labels.items()
+        if label_matches_legal_forms(lab, forms_cfg)
+    } if apply_orgs else set()
+
+    def _cut_stats_cfg(base_graph, degree_n: int):
+        H = base_graph.copy()
+        removed = 0
+        if org_for_cfg:
+            drop = [n for n in org_for_cfg if n in H]
+            H.remove_nodes_from(drop)
+            removed += len(drop)
+        if degree_n > 0 and H.number_of_nodes() > 0:
+            hubs = [n for n, d in dict(H.degree()).items() if d > degree_n]
+            H.remove_nodes_from(hubs)
+            removed += len(hubs)
+        if H.number_of_nodes() == 0:
+            return removed, 0, 0, 0
+        comps = sorted(nx.connected_components(H), key=len, reverse=True)
+        return removed, len(comps), len(comps[0]), sum(len(c) for c in comps[:5])
+
+    rem, n_cc, top1, top5 = _cut_stats_cfg(graph, cfg_n)
     config_result = pd.DataFrame(
         [
             ('hub_degree_n (config)', cfg_n),
-            ('remove_legal_entities (config)', cfg_orgs),
-            ('снято узлов', cfg_stats['снято узлов']),
-            ('компонент после среза', cfg_stats['компонент после']),
-            ('размер топ-1 после среза', cfg_stats['размер топ-1']),
-            ('размер топ-5 (сумма)', cfg_stats['размер топ-5 (сумма)']),
+            ('legal_forms_remove (шт.)', len(forms_cfg)),
+            ('legal_forms_remove активен', apply_orgs),
+            ('снято узлов', rem),
+            ('компонент после среза', n_cc),
+            ('размер топ-1 после среза', top1),
+            ('размер топ-5 (сумма)', top5),
         ],
         columns=['параметр', 'значение'],
     )
@@ -405,21 +475,23 @@ def show_degree_report(group_index: int = 0, top_n: int = 40):
         group_index, top_n=top_n,
     )
     cfg_n = _hub_degree_n()
-    cfg_orgs = _remove_legal_entities()
+    forms = _legal_forms_remove()
     n_cc = int(config_result.loc[
         config_result['параметр'] == 'компонент после среза', 'значение'
     ].iloc[0]) if len(config_result) else 0
     top1 = int(config_result.loc[
         config_result['параметр'] == 'размер топ-1 после среза', 'значение'
     ].iloc[0]) if len(config_result) else 0
+    forms_preview = ', '.join(forms[:8]) + ('…' if len(forms) > 8 else '')
 
     display(Markdown(
         f'### Краткий итог по `config` (группа {group_index})\n'
         f'- `hub_degree_n` = **{cfg_n}** (0 = срез по степени выкл.)\n'
-        f'- `remove_legal_entities` = **{cfg_orgs}**\n'
+        f'- `legal_forms_remove` = **{len(forms)}** форм'
+        f'{f" (`{forms_preview}`)" if forms else " (пусто → юрлиц не удаляем)"}\n'
         f'- после среза: **{n_cc:,}** компонент, топ-1 = **{top1:,}** узлов\n'
-        f'- если топ-1 всё ещё огромный — поднимите `hub_degree_n` или '
-        f'включите `remove_legal_entities = True` в `src/config.py`'
+        f'- чтобы оставить ОПФ/бренд — уберите строку из `legal_forms_remove`; '
+        f'чтобы выключить срез юрлиц — поставьте `legal_forms_remove = []`'
     ))
     display(config_result)
     display(Markdown(
@@ -429,7 +501,10 @@ def show_degree_report(group_index: int = 0, top_n: int = 40):
     display(cut_scenarios)
     display(Markdown('### Сводка по группе (до среза)'))
     display(summary)
-    display(Markdown(f'### Топ-{top_n} хабов'))
+    display(Markdown(
+        f'### Топ-{top_n} хабов '
+        '(колонка **в_срезе** — попадёт ли под `legal_forms_remove`)'
+    ))
     display(top_hubs)
     return summary, top_hubs, cut_scenarios, config_result
 
@@ -933,22 +1008,22 @@ def load_statistics():
         
 def apply_group_cuts(graph: nx.Graph, objects_df: pd.DataFrame):
     """
-    Срез по config: юрлица и/или хабы degree > hub_degree_n.
+    Срез по config: legal_forms_remove и/или хабы degree > hub_degree_n.
 
-    Порядок: сначала юрлица (если флаг), затем пересчёт степеней и срез хабов.
-    Возвращает (новый_граф, описание_среза).
+    Порядок: сначала юрлица из списка, затем пересчёт степеней и срез хабов.
     """
     H = graph.copy()
     removed_orgs = 0
     removed_hubs = 0
-    if _remove_legal_entities() and H.number_of_nodes():
+    forms = _legal_forms_remove()
+    if forms and H.number_of_nodes():
         drop = []
         for node in list(H.nodes):
             try:
                 label = objects_df.loc[node, 0]
             except Exception:
                 label = str(node)
-            if is_legal_entity_label(label):
+            if label_matches_legal_forms(label, forms):
                 drop.append(node)
         H.remove_nodes_from(drop)
         removed_orgs = len(drop)
@@ -1236,7 +1311,7 @@ def visualize():
     people_len = len(people)
     log(
         f'срез: hub_degree_n={_hub_degree_n()}, '
-        f'remove_legal_entities={_remove_legal_entities()}',
+        f'legal_forms_remove={len(_legal_forms_remove())} шт.',
         level='info',
     )
 
