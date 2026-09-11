@@ -1,0 +1,15 @@
+.env
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ipynb_checkpoints/
+output/
+vars/
+*.xlsx
+*.xls
+*.html
+*.gexf
+.DS_Store
+_patch_*.py
