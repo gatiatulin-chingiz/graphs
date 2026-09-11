@@ -5,8 +5,9 @@
 - Кэш: если Excel/SQL (и `bound`) не менялись — загрузка артефактов из `./vars` с уведомлением; иначе полный пересчёт и новый `input_fingerprint.json`.
 - Пайплайн без кнопок/GUI: `run()` сразу считает или поднимает кэш, затем визуализация.
 - Удалён неиспользуемый код: ipywidgets/кнопки, sociohub, matplotlib/requests, дубли импортов, закомментированные ветки GUI.
-- HTML: топ-20 групп; каждая группа бьётся на компоненты в `./output/html/group_{N}/{N}_{k}.html`.
-- Gephi: полные графы в `./output/gephi/Group_visualisation{N}.gexf` (без разбиения).
+- HTML/Gephi: топ-200 групп (`VIZ_TOP_N`); HTML по компонентам в `./output/html/group_{N}/`.
+- Логи пайплайна сжаты до шагов `[1/4]…[4/4]` без tqdm/лишних «Готово».
+- Gephi: полные графы в `./output/gephi/` (без разбиения на компоненты).
 - Исправлен запуск в Jupyter: пакет `src/`, вызов `run_pipeline()` вместо `run()` (конфликт с IPython `%run`).
 - Перед `run_pipeline()` создаются `./vars`, `./output`, `./output/html`, `./output/gephi`; старые HTML/Gephi удаляются.
 - Визуализация: без physics/menu; title рёбер ≤ 3 убытков.
