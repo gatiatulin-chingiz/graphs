@@ -1,6 +1,7 @@
 import os
 import json
 import pickle
+import shutil
 import datetime
 from itertools import combinations
 from concurrent.futures import ThreadPoolExecutor
@@ -20,11 +21,26 @@ bound = config.bound
 VARS_DIR = './vars'
 OUTPUT_DIR = './output'
 GEPHI_DIR = os.path.join(OUTPUT_DIR, 'gephi')
+HTML_DIR = os.path.join(OUTPUT_DIR, 'html')
 FINGERPRINT_PATH = os.path.join(VARS_DIR, 'input_fingerprint.json')
+VIZ_TOP_N = 20
 REQUIRED_ARTIFACTS = (
     'data', 'people', 'VIN', 'objects', 'columns',
     'links', 'G', 'groups', 'stat',
 )
+
+
+def clear_graph_outputs():
+    """Удалить старые HTML и Gephi перед новым расчётом/визуализацией."""
+    print('Удаляю старые HTML/Gephi графы...')
+    for path in (HTML_DIR, GEPHI_DIR):
+        if os.path.isdir(path):
+            shutil.rmtree(path)
+    if os.path.isdir(OUTPUT_DIR):
+        for name in os.listdir(OUTPUT_DIR):
+            full = os.path.join(OUTPUT_DIR, name)
+            if os.path.isfile(full) and name.lower().endswith(('.html', '.gexf')):
+                os.remove(full)
 
 
 def _list_input_files():
@@ -94,6 +110,7 @@ def try_load_cached_artifacts():
 
 def run():
     """Пайплайн без GUI: кэш или полный пересчёт, затем визуализация и Gephi."""
+    clear_graph_outputs()
     cached, fingerprint = try_load_cached_artifacts()
     if not cached:
         print('Вход изменился или нет кэша — полный пересчёт...')
@@ -669,7 +686,7 @@ def visualize():
                 attrs[key] = '' if value is None else str(value)
         return H
 
-    def save_outputs(graph, stem):
+    def save_html(graph, html_path):
         if graph.number_of_nodes() == 0:
             return
         pos = nx.spring_layout(graph, seed=42)
@@ -679,10 +696,7 @@ def visualize():
             graph.nodes[node]['y'] = float(y) * scale
             graph.nodes[node]['physics'] = False
 
-        os.makedirs(OUTPUT_DIR, exist_ok=True)
-        os.makedirs(GEPHI_DIR, exist_ok=True)
-
-        html_path = os.path.join(OUTPUT_DIR, f'{stem}.html')
+        os.makedirs(os.path.dirname(html_path) or '.', exist_ok=True)
         nt = Network(
             '100vh',
             '100%',
@@ -707,6 +721,11 @@ def visualize():
         nt.show(html_path, notebook=False)
         print(f'HTML сохранён: {html_path}')
 
+    def save_gephi(graph, stem):
+        """Полный граф группы без разбиения на компоненты."""
+        if graph.number_of_nodes() == 0:
+            return
+        os.makedirs(GEPHI_DIR, exist_ok=True)
         gexf_path = os.path.join(GEPHI_DIR, f'{stem}.gexf')
         nx.write_gexf(_sanitize_for_gexf(graph), gexf_path)
         print(f'Gephi GEXF сохранён: {gexf_path}')
@@ -714,7 +733,7 @@ def visualize():
     print('6. Визуализация данных (HTML + Gephi)...')
     objects = pd.DataFrame(objects)
 
-    for group in range(len(big_groups[:5])):
+    for group in range(len(big_groups[:VIZ_TOP_N])):
         group_nodes = big_groups[group]
         sub_links = links[links['obj1'].isin(group_nodes)]
         G = nx.from_pandas_edgelist(sub_links, 'obj1', 'obj2', create_using=nx.Graph())
@@ -776,13 +795,18 @@ def visualize():
                 G[left][right]['width'] = 4
                 G[left][right]['title'] = title
 
-        if group == 0:
-            components = sorted(nx.connected_components(G), key=len, reverse=True)
-            for comp_i, comp in enumerate(components):
-                H = relabel_graph(G.subgraph(comp).copy())
-                save_outputs(H, f'Group_visualisation0_{comp_i}')
-        else:
-            H = relabel_graph(G)
-            save_outputs(H, f'Group_visualisation{group}')
+        # Gephi — полный граф группы (без разбиения на компоненты)
+        full = relabel_graph(G.copy())
+        save_gephi(full, f'Group_visualisation{group}')
+
+        # HTML — все группы бьём на компоненты, каждая в своей папке
+        group_html_dir = os.path.join(HTML_DIR, f'group_{group}')
+        components = sorted(nx.connected_components(G), key=len, reverse=True)
+        for comp_i, comp in enumerate(components):
+            H = relabel_graph(G.subgraph(comp).copy())
+            save_html(
+                H,
+                os.path.join(group_html_dir, f'{group}_{comp_i}.html'),
+            )
 
     print('Визуализация завершена ✅')
