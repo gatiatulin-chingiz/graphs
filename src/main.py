@@ -22,6 +22,43 @@ def _viz_top_n() -> int:
     return max(1, int(getattr(config, 'viz_top_n', 200)))
 
 
+def _hub_degree_n() -> int:
+    """Порог degree > N; 0 = срез по степени выключен."""
+    return max(0, int(getattr(config, 'hub_degree_n', 0)))
+
+
+def _remove_legal_entities() -> bool:
+    return bool(getattr(config, 'remove_legal_entities', False))
+
+
+# Маркеры юрлиц в текстовой метке объекта (верхний регистр).
+_ORG_MARKERS = (
+    'ООО', 'АО"', 'АО «', 'АО ', '"АО', 'ПАО', 'СПАО', 'НАО', 'ЗАО', 'ОАО',
+    'АКЦИОНЕРН', 'ОБЩЕСТВО С ОГРАНИЧЕННОЙ', 'ЛИЗИНГ', 'СТРАХ', 'СОГАЗ',
+    'ИНГОССТРАХ', 'РЕСО', 'АЛЬФАСТРАХ', 'ГБУ', 'МБУ', 'ФГУП', 'ФКУ',
+    'КАРШЕРИНГ', 'ГОСУДАРСТВЕНН',
+)
+
+
+def is_legal_entity_label(label) -> bool:
+    """Эвристика: метка похожа на организацию, а не на ФИО+ДР."""
+    text = str(label).strip()
+    if not text or text.lower() in ('nan', 'none', 'nat'):
+        return False
+    upper = text.upper()
+    if any(marker in upper for marker in _ORG_MARKERS):
+        return True
+    # «ФИО nan» / длинное имя без даты — часто юрлицо из people
+    parts = text.split()
+    if len(parts) >= 2 and parts[-1].lower() in ('nan', 'nat', 'none'):
+        body = ' '.join(parts[:-1]).upper()
+        if any(marker in body for marker in _ORG_MARKERS):
+            return True
+        if '"' in text or '«' in text or '»' in text:
+            return True
+    return False
+
+
 VARS_DIR = './vars'
 OUTPUT_DIR = './output'
 GEPHI_DIR = os.path.join(OUTPUT_DIR, 'gephi')
@@ -29,7 +66,6 @@ HTML_DIR = os.path.join(OUTPUT_DIR, 'html')
 FINGERPRINT_PATH = os.path.join(VARS_DIR, 'input_fingerprint.json')
 # Ниже этого порога — подробные title на рёбрах; выше — быстрая стилизация
 DETAILED_STYLE_MAX_EDGES = 50_000
-MAX_RELABEL_NODES = 10_000
 # Physics / spring только на малых компонентах (иначе снова зависания)
 PHYSICS_MAX_NODES = 400
 PHYSICS_MAX_EDGES = 2_000
@@ -147,11 +183,13 @@ def run_pipeline():
     """Пайплайн: кэш или пересчёт → статистика/Gephi/HTML. Без GUI в ноутбуке.
 
     В Jupyter вызывайте ``run_pipeline()``, не ``run()`` (конфликт с ``%run``).
-    Число групп для отрисовки: ``config.viz_top_n``.
+    Рычаги: ``config.viz_top_n``, ``hub_degree_n``, ``remove_legal_entities``.
     """
     top_n = _viz_top_n()
     log('Пайплайн графов', level='header')
     log(f'viz_top_n = {top_n}', level='info')
+    log(f'hub_degree_n = {_hub_degree_n()}', level='info')
+    log(f'remove_legal_entities = {_remove_legal_entities()}', level='info')
     ensure_artifact_dirs()
     clear_graph_outputs()
     ensure_artifact_dirs()
@@ -210,20 +248,42 @@ def _subgraph_for_group(group_index: int = 0) -> nx.Graph:
 
 def degree_report(group_index: int = 0, top_n: int = 40):
     """
-    Таблицы для выбора порога хабов (degree > N).
+    Таблицы для подбора hub_degree_n и флага remove_legal_entities.
 
-    Возвращает (summary, top_hubs, cut_scenarios).
-    Скорость: O(E) — на сотнях тысяч рёбер обычно секунды.
+    Возвращает (summary, top_hubs, cut_scenarios, config_result).
+    config_result — итог при текущих значениях из config.py.
     """
     ensure_runtime_state()
     graph = _subgraph_for_group(group_index)
     people_count = len(people)
     objects_df = pd.DataFrame(objects)
 
+    def _label(i):
+        if i in objects_df.index:
+            return str(objects_df.loc[i, 0])
+        return str(i)
+
+    def _clean_label(raw: str) -> str:
+        text = str(raw).strip()
+        for bad in (' nan', ' NaT', ' None', ' nan'):
+            if text.endswith(bad):
+                text = text[: -len(bad)].strip()
+        return text
+
+    def _node_kind(i, label: str) -> str:
+        if is_legal_entity_label(label):
+            return 'юрлицо'
+        if i >= people_count:
+            return 'VIN'
+        return 'человек'
+
     deg = pd.Series(dict(graph.degree()), name='degree')
     if deg.empty:
         empty = pd.DataFrame()
-        return empty, empty, empty
+        return empty, empty, empty, empty
+
+    labels = {i: _clean_label(_label(i)) for i in deg.index}
+    org_nodes = {i for i, lab in labels.items() if is_legal_entity_label(lab)}
 
     def _pct(p):
         return float(np.percentile(deg.to_numpy(), p))
@@ -232,14 +292,17 @@ def degree_report(group_index: int = 0, top_n: int = 40):
     mean_d = float(deg.mean())
     std_d = float(deg.std(ddof=0)) if len(deg) > 1 else 0.0
     mean_2std = mean_d + 2 * std_d
+    n_cc_now = nx.number_connected_components(graph)
 
     summary = pd.DataFrame(
         [
-            ('group_index', group_index),
+            ('group_index', int(group_index)),
             ('узлов', int(graph.number_of_nodes())),
             ('рёбер', int(graph.number_of_edges())),
+            ('компонент сейчас', int(n_cc_now)),
+            ('из них похожих на юрлица', int(len(org_nodes))),
             ('degree min', int(deg.min())),
-            ('degree median', float(deg.median())),
+            ('degree median', round(float(deg.median()), 2)),
             ('degree mean', round(mean_d, 2)),
             ('degree std', round(std_d, 2)),
             ('degree p90', round(p90, 2)),
@@ -257,13 +320,43 @@ def degree_report(group_index: int = 0, top_n: int = 40):
         .rename_axis('obj_idx')
         .reset_index()
     )
-    top_hubs['тип'] = np.where(top_hubs['obj_idx'] > people_count, 'VIN', 'человек')
-    top_hubs['метка'] = top_hubs['obj_idx'].map(
-        lambda i: str(objects_df.loc[i, 0]) if i in objects_df.index else str(i)
-    )
+    top_hubs['метка'] = top_hubs['obj_idx'].map(lambda i: labels.get(i, str(i)))
+    top_hubs['тип'] = [
+        _node_kind(i, labels.get(i, '')) for i in top_hubs['obj_idx']
+    ]
+    top_hubs = top_hubs[['obj_idx', 'degree', 'тип', 'метка']]
+
+    def _cut_stats(base_graph, remove_orgs: bool, degree_n: int):
+        """Срез → число компонент и размеры топ-компонент."""
+        H = base_graph.copy()
+        removed = 0
+        if remove_orgs and org_nodes:
+            drop = [n for n in org_nodes if n in H]
+            H.remove_nodes_from(drop)
+            removed += len(drop)
+        if degree_n > 0 and H.number_of_nodes() > 0:
+            deg_h = dict(H.degree())
+            hubs = [n for n, d in deg_h.items() if d > degree_n]
+            H.remove_nodes_from(hubs)
+            removed += len(hubs)
+        if H.number_of_nodes() == 0:
+            return {
+                'снято узлов': removed,
+                'компонент после': 0,
+                'размер топ-1': 0,
+                'размер топ-5 (сумма)': 0,
+            }
+        comps = sorted(nx.connected_components(H), key=len, reverse=True)
+        return {
+            'снято узлов': removed,
+            'компонент после': len(comps),
+            'размер топ-1': len(comps[0]),
+            'размер топ-5 (сумма)': sum(len(c) for c in comps[:5]),
+        }
 
     scenarios = []
     for name, thr in [
+        ('только юрлица', 0),
         ('p90', p90),
         ('p95', p95),
         ('p99', p99),
@@ -271,51 +364,74 @@ def degree_report(group_index: int = 0, top_n: int = 40):
         ('degree>20', 20),
         ('degree>50', 50),
         ('degree>100', 100),
+        ('degree>200', 200),
+        ('config hub_degree_n', _hub_degree_n()),
     ]:
-        thr_i = int(np.floor(thr))
-        hubs = set(deg[deg > thr_i].index)
-        if not hubs:
-            scenarios.append(
-                {
-                    'сценарий': name,
-                    'порог N (degree > N)': thr_i,
-                    'хабов снято': 0,
-                    'компонент после': graph.number_connected_components(),
-                    'размер топ-1': max((len(c) for c in nx.connected_components(graph)), default=0),
-                    'размер топ-5 (сумма)': 0,
-                }
-            )
-            continue
-        H = graph.copy()
-        H.remove_nodes_from(hubs)
-        comps = sorted(nx.connected_components(H), key=len, reverse=True)
-        top5 = sum(len(c) for c in comps[:5])
-        scenarios.append(
-            {
-                'сценарий': name,
+        thr_i = int(np.floor(thr)) if name != 'только юрлица' else 0
+        for drop_orgs, org_tag in [(False, 'юрлица: оставить'), (True, 'юрлица: удалить')]:
+            if name == 'только юрлица' and not drop_orgs:
+                continue
+            stats = _cut_stats(graph, remove_orgs=drop_orgs, degree_n=thr_i)
+            scenarios.append({
+                'сценарий': name if name != 'только юрлица' else 'без порога N',
+                'юрлица': org_tag,
                 'порог N (degree > N)': thr_i,
-                'хабов снято': len(hubs),
-                'компонент после': len(comps),
-                'размер топ-1': len(comps[0]) if comps else 0,
-                'размер топ-5 (сумма)': top5,
-            }
-        )
+                **stats,
+            })
     cut_scenarios = pd.DataFrame(scenarios)
-    return summary, top_hubs, cut_scenarios
+
+    cfg_n = _hub_degree_n()
+    cfg_orgs = _remove_legal_entities()
+    cfg_stats = _cut_stats(graph, remove_orgs=cfg_orgs, degree_n=cfg_n)
+    config_result = pd.DataFrame(
+        [
+            ('hub_degree_n (config)', cfg_n),
+            ('remove_legal_entities (config)', cfg_orgs),
+            ('снято узлов', cfg_stats['снято узлов']),
+            ('компонент после среза', cfg_stats['компонент после']),
+            ('размер топ-1 после среза', cfg_stats['размер топ-1']),
+            ('размер топ-5 (сумма)', cfg_stats['размер топ-5 (сумма)']),
+        ],
+        columns=['параметр', 'значение'],
+    )
+    return summary, top_hubs, cut_scenarios, config_result
 
 
 def show_degree_report(group_index: int = 0, top_n: int = 40):
-    """Показать отчёт по степеням в Jupyter."""
+    """Краткий отчёт в Jupyter: итог по config + сценарии (с числом компонент)."""
     from IPython.display import display, Markdown
 
-    summary, top_hubs, cut_scenarios = degree_report(group_index, top_n=top_n)
-    display(Markdown(f'### Степени группы {group_index} (для выбора N: режем degree **> N**)'))
-    display(summary)
-    display(Markdown('### Сценарии среза хабов'))
+    summary, top_hubs, cut_scenarios, config_result = degree_report(
+        group_index, top_n=top_n,
+    )
+    cfg_n = _hub_degree_n()
+    cfg_orgs = _remove_legal_entities()
+    n_cc = int(config_result.loc[
+        config_result['параметр'] == 'компонент после среза', 'значение'
+    ].iloc[0]) if len(config_result) else 0
+    top1 = int(config_result.loc[
+        config_result['параметр'] == 'размер топ-1 после среза', 'значение'
+    ].iloc[0]) if len(config_result) else 0
+
+    display(Markdown(
+        f'### Краткий итог по `config` (группа {group_index})\n'
+        f'- `hub_degree_n` = **{cfg_n}** (0 = срез по степени выкл.)\n'
+        f'- `remove_legal_entities` = **{cfg_orgs}**\n'
+        f'- после среза: **{n_cc:,}** компонент, топ-1 = **{top1:,}** узлов\n'
+        f'- если топ-1 всё ещё огромный — поднимите `hub_degree_n` или '
+        f'включите `remove_legal_entities = True` в `src/config.py`'
+    ))
+    display(config_result)
+    display(Markdown(
+        '### Сценарии среза '
+        '(колонка **«компонент после»** — сколько кусков получится)'
+    ))
     display(cut_scenarios)
+    display(Markdown('### Сводка по группе (до среза)'))
+    display(summary)
     display(Markdown(f'### Топ-{top_n} хабов'))
     display(top_hubs)
-    return summary, top_hubs, cut_scenarios
+    return summary, top_hubs, cut_scenarios, config_result
 
 
 def load():
@@ -815,54 +931,126 @@ def load_statistics():
     objects = pd.DataFrame(objects)
     log(f'big_groups из vars: {len(big_groups)}', level='info')
         
+def apply_group_cuts(graph: nx.Graph, objects_df: pd.DataFrame):
+    """
+    Срез по config: юрлица и/или хабы degree > hub_degree_n.
+
+    Порядок: сначала юрлица (если флаг), затем пересчёт степеней и срез хабов.
+    Возвращает (новый_граф, описание_среза).
+    """
+    H = graph.copy()
+    removed_orgs = 0
+    removed_hubs = 0
+    if _remove_legal_entities() and H.number_of_nodes():
+        drop = []
+        for node in list(H.nodes):
+            try:
+                label = objects_df.loc[node, 0]
+            except Exception:
+                label = str(node)
+            if is_legal_entity_label(label):
+                drop.append(node)
+        H.remove_nodes_from(drop)
+        removed_orgs = len(drop)
+    degree_n = _hub_degree_n()
+    if degree_n > 0 and H.number_of_nodes():
+        hubs = [n for n, d in H.degree() if d > degree_n]
+        H.remove_nodes_from(hubs)
+        removed_hubs = len(hubs)
+    n_cc = nx.number_connected_components(H) if H.number_of_nodes() else 0
+    info = {
+        'removed_orgs': removed_orgs,
+        'removed_hubs': removed_hubs,
+        'nodes_left': H.number_of_nodes(),
+        'components': n_cc,
+    }
+    return H, info
+
+
 def visualize():
     global links, data, big_groups, objects, people, VIN, ID_col
 
-    def loss_title(loss_ids):
+    def loss_text(loss_ids, limit=3):
+        """До ``limit`` номеров убытков через запятую (для title/label рёбер)."""
         if not loss_ids:
             return ''
-        unique_ids = list(pd.unique(data.loc[loss_ids, ID_col]))[:3]
-        return ', '.join(str(v) for v in unique_ids)
+        try:
+            unique_ids = list(pd.unique(data.loc[loss_ids, ID_col]))[:limit]
+        except Exception:
+            return ''
+        return ', '.join(str(v) for v in unique_ids if pd.notna(v))
 
-    def relabel_graph(graph):
-        temp = objects.loc[list(objects.index < len(people)), 0]
-        temp = temp[list(set(people.index) & set(graph.nodes))]
-        temp = temp.str.split(' ').apply(lambda x: x[0].lower().capitalize()).to_dict()
-        temp = {
-            **temp,
-            **(objects.loc[list((objects.index >= len(people))), 0][
-                list(set(graph.nodes) - set(people.index))
-            ].to_dict()),
-        }
-        df = pd.DataFrame(pd.Series(temp))
-        df[1] = df[0]
-        df.loc[df[0].duplicated(keep=False), 1] = (
-            df.loc[df[0].duplicated(keep=False), 0]
-            + ' '
-            + df.groupby(0).cumcount().add(1).astype(str)
+    def short_person_label(full_text: str) -> str:
+        """Фамилия + инициалы + дата рождения; VIN оставляем как есть."""
+        raw = str(full_text).strip()
+        if not raw or raw.lower() in ('nan', 'none', 'nat'):
+            return raw
+        parts = raw.split()
+        if not parts:
+            return raw
+        bd = ''
+        name_parts = parts
+        last = parts[-1]
+        if len(last) >= 8 and (('-' in last) or ('.' in last) or last.isdigit()):
+            if last.lower() not in ('nan', 'nat', 'none'):
+                bd = last[:10]
+            name_parts = parts[:-1]
+        if not name_parts:
+            return bd or raw
+        # VIN / короткий код без пробелов ФИО
+        if len(name_parts) == 1 and len(name_parts[0]) <= 20 and not name_parts[0].isalpha():
+            return name_parts[0] + (f' {bd}' if bd else '')
+        surname = name_parts[0].capitalize()
+        initials = ''.join(
+            f'{p[0].upper()}.' for p in name_parts[1:3] if p
         )
-        mapping = pd.Series(df[1].values, index=temp.keys()).to_dict()
-        return nx.relabel_nodes(graph, mapping)
+        short = surname + (f' {initials}' if initials else '')
+        if bd:
+            short = f'{short} {bd}'
+        return short
+
+    def node_labels(obj_idx, people_len):
+        """Полное имя (title) и короткое (label) для узла."""
+        try:
+            full = str(objects.loc[obj_idx, 0])
+        except Exception:
+            full = str(obj_idx)
+        if obj_idx >= people_len:
+            short = full if len(full) <= 17 else full[:17]
+            return full, short
+        return full, short_person_label(full)
 
     def _sanitize_for_gexf(graph):
+        """Строковые атрибуты; weight всегда > 0 (иначе Gephi дропает рёбра)."""
         H = graph.copy()
         for node in H.nodes:
             for key, value in list(H.nodes[node].items()):
-                if key in ('x', 'y', 'physics'):
+                if key in ('x', 'y', 'physics', 'width'):
                     H.nodes[node].pop(key, None)
                     continue
                 H.nodes[node][key] = '' if value is None else str(value)
-        for u, v, attrs in H.edges(data=True):
+        for _u, _v, attrs in H.edges(data=True):
             for key, value in list(attrs.items()):
+                if key == 'weight':
+                    try:
+                        w = float(value)
+                    except (TypeError, ValueError):
+                        w = 1.0
+                    attrs[key] = max(w, 1.0)
+                    continue
+                if key == 'width':
+                    attrs.pop(key, None)
+                    continue
                 attrs[key] = '' if value is None else str(value)
+            if 'weight' not in attrs:
+                attrs['weight'] = 1.0
+            # Gephi показывает Label; title дублируем в label, если label пуст
+            if not attrs.get('label') and attrs.get('title'):
+                attrs['label'] = attrs['title']
         return H
 
-    def _node_hover_text(node_id, attrs):
-        text = attrs.get('title') or attrs.get('label') or str(node_id)
-        return str(text).strip().replace('\n', ' ')
-
     def save_html(graph, html_path):
-        """HTML (vis-network): кружки, ФИО в title (hover), physics на малых графах."""
+        """HTML: короткие label на узлах/рёбрах, полные title на hover."""
         if graph.number_of_nodes() == 0:
             return
         parent = os.path.dirname(html_path)
@@ -888,19 +1076,21 @@ def visualize():
             first = True
             for i, node in enumerate(graph.nodes):
                 attrs = graph.nodes[node]
+                label = str(attrs.get('label') or node)
+                title = str(attrs.get('title') or label)
                 item = {
                     'id': str(node),
-                    'label': '',  # пустой label → кружок, не овал от длинного ФИО
-                    'title': _node_hover_text(node, attrs),
+                    'label': label,
+                    'title': title,
                     'shape': 'dot',
-                    'size': 10,
+                    'size': 12,
                     'color': attrs.get('color', 'grey'),
                 }
                 if use_physics:
                     item['physics'] = True
                 else:
                     item['physics'] = False
-                    item['x'] = float(i % side) * 80.0
+                    item['x'] = float(i % side) * 120.0
                     item['y'] = float(i // side) * 80.0
                 if not first:
                     fh.write(',\n')
@@ -909,15 +1099,18 @@ def visualize():
             fh.write('\n]);\nconst edges=new vis.DataSet([\n')
             first = True
             for u, v, attrs in graph.edges(data=True):
+                edge_title = str(attrs.get('title') or '')
+                edge_label = str(attrs.get('label') or edge_title)
                 item = {
                     'from': str(u),
                     'to': str(v),
                     'color': attrs.get('color', '#999'),
-                    'width': int(attrs.get('width', 1) or 1),
+                    'width': int(float(attrs.get('width', 1) or 1)),
                 }
-                title = attrs.get('title')
-                if title:
-                    item['title'] = str(title)
+                if edge_label:
+                    item['label'] = edge_label
+                if edge_title:
+                    item['title'] = edge_title
                 if not first:
                     fh.write(',\n')
                 first = False
@@ -931,7 +1124,9 @@ def visualize():
                 '\n]);\n'
                 'new vis.Network(document.getElementById("m"),{nodes,edges},{'
                 f'{phys_js}'
-                'nodes:{shape:"dot",size:10,font:{size:0}},'
+                'nodes:{shape:"dot",size:12,font:{size:11,face:"Arial",color:"#222"}},'
+                'edges:{font:{size:9,align:"middle",color:"#444"},'
+                'smooth:{type:"continuous"}},'
                 'interaction:{dragNodes:true,dragView:true,zoomView:true,hover:true}'
                 '});\n</script></body></html>\n'
             )
@@ -943,9 +1138,28 @@ def visualize():
         gexf_path = os.path.join(GEPHI_DIR, f'{stem}.gexf')
         nx.write_gexf(_sanitize_for_gexf(graph), gexf_path)
 
+    def _edge_loss_index(sub_links):
+        a = np.minimum(sub_links['obj1'].to_numpy(), sub_links['obj2'].to_numpy())
+        b = np.maximum(sub_links['obj1'].to_numpy(), sub_links['obj2'].to_numpy())
+        edge_meta = sub_links.assign(_a=a, _b=b)
+        edge_types = (
+            edge_meta.groupby(['_a', '_b'])['link_type']
+            .agg(lambda s: set(s.unique()))
+            .to_dict()
+        )
+        edge_loss_idx = (
+            edge_meta[edge_meta['Loss_idx'].notna()]
+            .groupby(['_a', '_b'])['Loss_idx']
+            .agg(lambda s: list(pd.unique(s)))
+            .to_dict()
+        )
+        return edge_types, edge_loss_idx
+
     def style_graph(G, sub_links, people_len):
-        """Раскраска узлов/рёбер. На больших графах — упрощённо."""
+        """Цвет + короткие label / полные title; weight всегда ≥ 1."""
         n_edges = G.number_of_edges()
+        edge_types, edge_loss_idx = _edge_loss_index(sub_links)
+
         if n_edges > DETAILED_STYLE_MAX_EDGES:
             red = sub_links[
                 sub_links['link_type'].isin(['Victim_Culprit', 'Culprit_Victim'])
@@ -958,25 +1172,25 @@ def visualize():
                     G.nodes[i]['color'] = 'black'
                 else:
                     G.nodes[i]['color'] = 'grey'
-                try:
-                    G.nodes[i]['label'] = str(objects.loc[i, 0])
-                except Exception:
-                    G.nodes[i]['label'] = str(i)
+                full, short = node_labels(i, people_len)
+                G.nodes[i]['title'] = full
+                G.nodes[i]['label'] = short
+            for edge in G.edges:
+                left, right = sorted(edge)
+                losses = loss_text(edge_loss_idx.get((left, right), []))
+                G[left][right].update(
+                    color='black', weight=1.0, width=1,
+                    title=losses, label=losses,
+                )
             return
 
         node_types_df = pd.concat([
             sub_links[['obj1', 'link_type']].rename(columns={'obj1': 'obj'}),
             sub_links[['obj2', 'link_type']].rename(columns={'obj2': 'obj'}),
         ], ignore_index=True)
-        node_types = node_types_df.groupby('obj')['link_type'].agg(lambda s: set(s.unique())).to_dict()
-        a = np.minimum(sub_links['obj1'].to_numpy(), sub_links['obj2'].to_numpy())
-        b = np.maximum(sub_links['obj1'].to_numpy(), sub_links['obj2'].to_numpy())
-        edge_meta = sub_links.assign(_a=a, _b=b)
-        edge_types = edge_meta.groupby(['_a', '_b'])['link_type'].agg(lambda s: set(s.unique())).to_dict()
-        edge_loss_idx = (
-            edge_meta[edge_meta['Loss_idx'].notna()]
-            .groupby(['_a', '_b'])['Loss_idx']
-            .agg(lambda s: list(pd.unique(s)))
+        node_types = (
+            node_types_df.groupby('obj')['link_type']
+            .agg(lambda s: set(s.unique()))
             .to_dict()
         )
         for i in G.nodes:
@@ -987,24 +1201,44 @@ def visualize():
                 G.nodes[i]['color'] = 'black'
             else:
                 G.nodes[i]['color'] = 'grey'
-            G.nodes[i]['label'] = str(objects.loc[i, 0])
+            full, short = node_labels(i, people_len)
+            G.nodes[i]['title'] = full
+            G.nodes[i]['label'] = short
         for edge in G.edges:
             left, right = sorted(edge)
             key = (left, right)
             temp = edge_types.get(key, set())
-            title = loss_title(edge_loss_idx.get(key, []))
+            losses = loss_text(edge_loss_idx.get(key, []))
+            # Gephi: weight должен быть > 0
             if 'Culprit_VINv' in temp or 'Victim_VINc' in temp:
-                G[left][right].update(color='black', weight=0, title=title)
+                G[left][right].update(
+                    color='black', weight=1.0, width=1, title=losses, label=losses,
+                )
             elif 'VINv_VINc' in temp or 'VINc_VINv' in temp:
-                G[left][right].update(color='black', weight=2, width=2, title=title)
+                G[left][right].update(
+                    color='black', weight=2.0, width=2, title=losses, label=losses,
+                )
             elif 'Victim_VINv' in temp or 'Culprit_VINc' in temp:
-                G[left][right].update(color='black', weight=3, width=3, title=title)
+                G[left][right].update(
+                    color='black', weight=3.0, width=3, title=losses, label=losses,
+                )
             elif 'Victim_Culprit' in temp or 'Culprit_Victim' in temp:
-                G[left][right].update(color='red', weight=4, width=4, title=title)
+                G[left][right].update(
+                    color='red', weight=4.0, width=4, title=losses, label=losses,
+                )
+            else:
+                G[left][right].update(
+                    color='grey', weight=1.0, width=1, title=losses, label=losses,
+                )
 
     objects = pd.DataFrame(objects)
     n_groups = len(big_groups[:_viz_top_n()])
     people_len = len(people)
+    log(
+        f'срез: hub_degree_n={_hub_degree_n()}, '
+        f'remove_legal_entities={_remove_legal_entities()}',
+        level='info',
+    )
 
     for group in range(n_groups):
         group_nodes = big_groups[group]
@@ -1014,18 +1248,22 @@ def visualize():
         G = nx.from_pandas_edgelist(sub_links, 'obj1', 'obj2', create_using=nx.Graph())
         G.remove_edges_from(nx.selfloop_edges(G))
         n_nodes, n_edges = G.number_of_nodes(), G.number_of_edges()
+        G, cut_info = apply_group_cuts(G, objects)
+        sub_links = sub_links[
+            sub_links['obj1'].isin(G.nodes) & sub_links['obj2'].isin(G.nodes)
+        ]
         log(
-            f'группа {group + 1}/{n_groups}:  {n_nodes:,} узлов, {n_edges:,} рёбер',
+            f'группа {group + 1}/{n_groups}:  было {n_nodes:,} узлов / {n_edges:,} рёбер → '
+            f'осталось {cut_info["nodes_left"]:,}; снято юрлиц={cut_info["removed_orgs"]}, '
+            f'хабов={cut_info["removed_hubs"]}; компонент={cut_info["components"]}',
             level='info',
         )
+        if G.number_of_nodes() == 0:
+            log('группа пуста после среза — пропуск', level='warn')
+            continue
 
         style_graph(G, sub_links, people_len)
-
-        huge = n_edges > DETAILED_STYLE_MAX_EDGES
-        if huge:
-            save_gephi(G, f'Group_visualisation{group}')
-        else:
-            save_gephi(relabel_graph(G.copy()), f'Group_visualisation{group}')
+        save_gephi(G, f'Group_visualisation{group}')
 
         components = sorted(nx.connected_components(G), key=len, reverse=True)
         # Папка только если реально несколько компонент
@@ -1038,8 +1276,6 @@ def visualize():
 
         for comp_i, comp in enumerate(components):
             sub = G.subgraph(comp).copy()
-            if sub.number_of_nodes() <= MAX_RELABEL_NODES:
-                sub = relabel_graph(sub)
             if len(components) > 1:
                 html_name = f'{group}_{comp_i}.html'
             else:
