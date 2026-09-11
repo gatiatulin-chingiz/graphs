@@ -25,6 +25,9 @@ VIZ_TOP_N = 200
 # Ниже этого порога — подробные title на рёбрах; выше — быстрая стилизация
 DETAILED_STYLE_MAX_EDGES = 50_000
 MAX_RELABEL_NODES = 10_000
+# Physics / spring только на малых компонентах (иначе снова зависания)
+PHYSICS_MAX_NODES = 400
+PHYSICS_MAX_EDGES = 2_000
 REQUIRED_ARTIFACTS = (
     'data', 'people', 'VIN', 'objects', 'columns',
     'links', 'G', 'groups', 'stat',
@@ -146,6 +149,149 @@ def run_pipeline():
 
 # Для скриптов; в ноутбуке используйте run_pipeline()
 run = run_pipeline
+
+
+def ensure_runtime_state():
+    """Поднять data/links/big_groups из памяти или из ./vars."""
+    global links, big_groups, objects, people
+    need = (
+        'links' not in globals()
+        or links is None
+        or 'big_groups' not in globals()
+        or big_groups is None
+        or len(big_groups) == 0
+    )
+    if need:
+        ok, _ = try_load_cached_artifacts()
+        if not ok:
+            raise RuntimeError(
+                'Нет данных в памяти и кэш ./vars не подходит. Сначала run_pipeline().'
+            )
+    if not isinstance(objects, pd.DataFrame):
+        objects = pd.DataFrame(objects)
+
+
+def _subgraph_for_group(group_index: int = 0) -> nx.Graph:
+    ensure_runtime_state()
+    if group_index < 0 or group_index >= len(big_groups):
+        raise IndexError(f'group_index должен быть 0…{len(big_groups) - 1}')
+    group_nodes = big_groups[group_index]
+    sub_links = links[
+        links['obj1'].isin(group_nodes) & links['obj2'].isin(group_nodes)
+    ]
+    graph = nx.from_pandas_edgelist(sub_links, 'obj1', 'obj2', create_using=nx.Graph())
+    graph.remove_edges_from(nx.selfloop_edges(graph))
+    return graph
+
+
+def degree_report(group_index: int = 0, top_n: int = 40):
+    """
+    Таблицы для выбора порога хабов (degree > N).
+
+    Возвращает (summary, top_hubs, cut_scenarios).
+    Скорость: O(E) — на сотнях тысяч рёбер обычно секунды.
+    """
+    ensure_runtime_state()
+    graph = _subgraph_for_group(group_index)
+    people_count = len(people)
+    objects_df = pd.DataFrame(objects)
+
+    deg = pd.Series(dict(graph.degree()), name='degree')
+    if deg.empty:
+        empty = pd.DataFrame()
+        return empty, empty, empty
+
+    def _pct(p):
+        return float(np.percentile(deg.to_numpy(), p))
+
+    p90, p95, p99 = _pct(90), _pct(95), _pct(99)
+    mean_d = float(deg.mean())
+    std_d = float(deg.std(ddof=0)) if len(deg) > 1 else 0.0
+    mean_2std = mean_d + 2 * std_d
+
+    summary = pd.DataFrame(
+        [
+            ('group_index', group_index),
+            ('узлов', int(graph.number_of_nodes())),
+            ('рёбер', int(graph.number_of_edges())),
+            ('degree min', int(deg.min())),
+            ('degree median', float(deg.median())),
+            ('degree mean', round(mean_d, 2)),
+            ('degree std', round(std_d, 2)),
+            ('degree p90', round(p90, 2)),
+            ('degree p95', round(p95, 2)),
+            ('degree p99', round(p99, 2)),
+            ('degree max', int(deg.max())),
+            ('mean+2std', round(mean_2std, 2)),
+        ],
+        columns=['метрика', 'значение'],
+    )
+
+    top_hubs = (
+        deg.sort_values(ascending=False)
+        .head(top_n)
+        .rename_axis('obj_idx')
+        .reset_index()
+    )
+    top_hubs['тип'] = np.where(top_hubs['obj_idx'] > people_count, 'VIN', 'человек')
+    top_hubs['метка'] = top_hubs['obj_idx'].map(
+        lambda i: str(objects_df.loc[i, 0]) if i in objects_df.index else str(i)
+    )
+
+    scenarios = []
+    for name, thr in [
+        ('p90', p90),
+        ('p95', p95),
+        ('p99', p99),
+        ('mean+2std', mean_2std),
+        ('degree>20', 20),
+        ('degree>50', 50),
+        ('degree>100', 100),
+    ]:
+        thr_i = int(np.floor(thr))
+        hubs = set(deg[deg > thr_i].index)
+        if not hubs:
+            scenarios.append(
+                {
+                    'сценарий': name,
+                    'порог N (degree > N)': thr_i,
+                    'хабов снято': 0,
+                    'компонент после': graph.number_connected_components(),
+                    'размер топ-1': max((len(c) for c in nx.connected_components(graph)), default=0),
+                    'размер топ-5 (сумма)': 0,
+                }
+            )
+            continue
+        H = graph.copy()
+        H.remove_nodes_from(hubs)
+        comps = sorted(nx.connected_components(H), key=len, reverse=True)
+        top5 = sum(len(c) for c in comps[:5])
+        scenarios.append(
+            {
+                'сценарий': name,
+                'порог N (degree > N)': thr_i,
+                'хабов снято': len(hubs),
+                'компонент после': len(comps),
+                'размер топ-1': len(comps[0]) if comps else 0,
+                'размер топ-5 (сумма)': top5,
+            }
+        )
+    cut_scenarios = pd.DataFrame(scenarios)
+    return summary, top_hubs, cut_scenarios
+
+
+def show_degree_report(group_index: int = 0, top_n: int = 40):
+    """Показать отчёт по степеням в Jupyter."""
+    from IPython.display import display, Markdown
+
+    summary, top_hubs, cut_scenarios = degree_report(group_index, top_n=top_n)
+    display(Markdown(f'### Степени группы {group_index} (для выбора N: режем degree **> N**)'))
+    display(summary)
+    display(Markdown('### Сценарии среза хабов'))
+    display(cut_scenarios)
+    display(Markdown(f'### Топ-{top_n} хабов'))
+    display(top_hubs)
+    return summary, top_hubs, cut_scenarios
 
 
 def load():
@@ -687,20 +833,23 @@ def visualize():
                 attrs[key] = '' if value is None else str(value)
         return H
 
-    def _node_label(node_id, attrs):
-        label = attrs.get('label') or attrs.get('title') or str(node_id)
-        label = str(label).strip().replace('\n', ' ')
-        return label[:48]
+    def _node_hover_text(node_id, attrs):
+        text = attrs.get('title') or attrs.get('label') or str(node_id)
+        return str(text).strip().replace('\n', ' ')
 
     def save_html(graph, html_path):
-        """Пишет HTML со всеми узлами/рёбрами (vis-network). Без открытия браузера.
-
-        Большие файлы могут не открыться в браузере — файл всё равно сохраняется.
-        """
+        """HTML (vis-network): кружки, ФИО в title (hover), physics на малых графах."""
         if graph.number_of_nodes() == 0:
             return
-        os.makedirs(os.path.dirname(html_path) or '.', exist_ok=True)
+        parent = os.path.dirname(html_path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+
         n_nodes = graph.number_of_nodes()
+        n_edges = graph.number_of_edges()
+        use_physics = (
+            n_nodes <= PHYSICS_MAX_NODES and n_edges <= PHYSICS_MAX_EDGES
+        )
         side = max(1, int(np.ceil(np.sqrt(n_nodes))))
 
         with open(html_path, 'w', encoding='utf-8') as fh:
@@ -717,12 +866,18 @@ def visualize():
                 attrs = graph.nodes[node]
                 item = {
                     'id': str(node),
-                    'label': _node_label(node, attrs),
+                    'label': '',  # пустой label → кружок, не овал от длинного ФИО
+                    'title': _node_hover_text(node, attrs),
+                    'shape': 'dot',
+                    'size': 10,
                     'color': attrs.get('color', 'grey'),
-                    'x': float(i % side) * 80.0,
-                    'y': float(i // side) * 80.0,
-                    'physics': False,
                 }
+                if use_physics:
+                    item['physics'] = True
+                else:
+                    item['physics'] = False
+                    item['x'] = float(i % side) * 80.0
+                    item['y'] = float(i // side) * 80.0
                 if not first:
                     fh.write(',\n')
                 first = False
@@ -743,11 +898,17 @@ def visualize():
                     fh.write(',\n')
                 first = False
                 json.dump(item, fh, ensure_ascii=False)
+            phys_js = (
+                'physics:{enabled:true,stabilization:{iterations:200}},'
+                if use_physics
+                else 'physics:{enabled:false},'
+            )
             fh.write(
                 '\n]);\n'
                 'new vis.Network(document.getElementById("m"),{nodes,edges},{'
-                'physics:{enabled:false},'
-                'interaction:{dragNodes:true,dragView:true,zoomView:true}'
+                f'{phys_js}'
+                'nodes:{shape:"dot",size:10,font:{size:0}},'
+                'interaction:{dragNodes:true,dragView:true,zoomView:true,hover:true}'
                 '});\n</script></body></html>\n'
             )
 
@@ -840,13 +1001,23 @@ def visualize():
             save_gephi(relabel_graph(G.copy()), f'Group_visualisation{group}')
 
         components = sorted(nx.connected_components(G), key=len, reverse=True)
-        group_html_dir = os.path.join(HTML_DIR, f'group_{group}')
+        # Папка только если реально несколько компонент
+        if len(components) > 1:
+            html_dir = os.path.join(HTML_DIR, f'group_{group}')
+            os.makedirs(html_dir, exist_ok=True)
+        else:
+            html_dir = HTML_DIR
+            os.makedirs(html_dir, exist_ok=True)
+
         for comp_i, comp in enumerate(components):
             sub = G.subgraph(comp).copy()
-            # relabel только на умеренных компонентах — иначе слишком долго
             if sub.number_of_nodes() <= MAX_RELABEL_NODES:
                 sub = relabel_graph(sub)
-            save_html(sub, os.path.join(group_html_dir, f'{group}_{comp_i}.html'))
+            if len(components) > 1:
+                html_name = f'{group}_{comp_i}.html'
+            else:
+                html_name = f'Group_visualisation{group}.html'
+            save_html(sub, os.path.join(html_dir, html_name))
         log(f'    → gephi + HTML компонент: {len(components)}')
 
     log(f'  итог: Gephi в {GEPHI_DIR}, HTML в {HTML_DIR}')
