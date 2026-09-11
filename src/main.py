@@ -212,11 +212,13 @@ def try_load_cached_artifacts():
     return True, fingerprint
 
 
-def run_pipeline():
-    """Пайплайн: кэш или пересчёт → статистика/Gephi/HTML. Без GUI в ноутбуке.
+def run_pipeline(*, draw: bool = False):
+    """Пайплайн: кэш или пересчёт → статистика. Отрисовка — отдельно.
 
-    В Jupyter вызывайте ``run_pipeline()``, не ``run()`` (конфликт с ``%run``).
-    Рычаги: ``config.viz_top_n``, ``hub_degree_n``, ``legal_forms_remove``.
+    По умолчанию ``draw=False``: сначала смотрите ``show_degree_report()``,
+    затем вызывайте ``visualize()`` (иначе на диск улетит куча HTML).
+
+    В Jupyter: ``run_pipeline()``, не ``run()`` (конфликт с ``%run``).
     """
     top_n = _viz_top_n()
     forms = _legal_forms_remove()
@@ -225,30 +227,65 @@ def run_pipeline():
     log(f'hub_degree_n = {_hub_degree_n()}', level='info')
     log(
         f'legal_forms_remove = {len(forms)} шт.'
-        + (f' ({", ".join(forms[:6])}…)' if len(forms) > 6 else (f' ({", ".join(forms)})' if forms else ' (выкл.)')),
+        + (
+            f' ({", ".join(forms[:6])}…)'
+            if len(forms) > 6
+            else (f' ({", ".join(forms)})' if forms else ' (выкл.)')
+        ),
         level='info',
     )
     ensure_artifact_dirs()
-    clear_graph_outputs()
-    ensure_artifact_dirs()
     cached, fingerprint = try_load_cached_artifacts()
     if not cached:
-        log('1/4  Загрузка и предобработка Excel', level='step')
+        log('1/3  Загрузка и предобработка Excel', level='step')
         load()
-        log('2/4  Построение связей', level='step')
+        log('2/3  Построение связей', level='step')
         create_links()
-        log('3/4  Статистика → ./output/statistics.xlsx', level='step')
+        log('3/3  Статистика → ./output/statistics.xlsx', level='step')
         create_statistics()
         _save_fingerprint(fingerprint)
     else:
-        log('1–3/4  Пересчёт пропущен (кэш)', level='ok')
-    log(f'4/4  Gephi + HTML (топ-{top_n} групп)', level='step')
-    visualize()
-    log('Готово', level='ok')
+        log('1–3/3  Пересчёт пропущен (кэш)', level='ok')
+    log_cut_preview(group_index=0)
+    if draw:
+        log(f'отрисовка Gephi + HTML (топ-{top_n})', level='step')
+        visualize()
+        log('Готово', level='ok')
+    else:
+        log(
+            'дальше: show_degree_report() → подберите N/формы → visualize()',
+            level='ok',
+        )
 
 
 # Для скриптов; в ноутбуке используйте run_pipeline()
 run = run_pipeline
+
+
+def log_cut_preview(group_index: int = 0) -> None:
+    """Краткий лог: сколько компонент будет после среза (без записи на диск)."""
+    try:
+        ensure_runtime_state()
+        graph = _subgraph_for_group(group_index)
+        objects_df = pd.DataFrame(objects)
+        before_n = graph.number_of_nodes()
+        before_cc = nx.number_connected_components(graph)
+        cut, info = apply_group_cuts(graph, objects_df)
+        log(
+            f'превью среза группы {group_index}: '
+            f'{before_n:,} узлов / {before_cc} комп. → '
+            f'{info["nodes_left"]:,} узлов / {info["components"]:,} комп. '
+            f'(юрлиц−{info["removed_orgs"]}, хабов−{info["removed_hubs"]})',
+            level='info',
+        )
+        if info['components'] > 500:
+            log(
+                'компонент очень много — сначала отчёт и пороги, '
+                'visualize() пишет только компоненты размером ≥ bound',
+                level='warn',
+            )
+    except Exception as exc:
+        log(f'превью среза недоступно: {exc}', level='warn')
 
 
 def ensure_runtime_state():
@@ -1045,6 +1082,13 @@ def apply_group_cuts(graph: nx.Graph, objects_df: pd.DataFrame):
 def visualize():
     global links, data, big_groups, objects, people, VIN, ID_col
 
+    ensure_runtime_state()
+    ensure_artifact_dirs()
+    clear_graph_outputs()
+    ensure_artifact_dirs()
+    log('Отрисовка Gephi/HTML', level='header')
+    log_cut_preview(group_index=0)
+
     def loss_text(loss_ids, limit=3):
         """До ``limit`` номеров убытков через запятую (для title/label рёбер)."""
         if not loss_ids:
@@ -1125,7 +1169,7 @@ def visualize():
         return H
 
     def save_html(graph, html_path):
-        """HTML: короткие label на узлах/рёбрах, полные title на hover."""
+        """HTML: подпись ФИО/VIN внутри фигуры узла (ellipse), title на hover."""
         if graph.number_of_nodes() == 0:
             return
         parent = os.path.dirname(html_path)
@@ -1138,6 +1182,31 @@ def visualize():
             n_nodes <= PHYSICS_MAX_NODES and n_edges <= PHYSICS_MAX_EDGES
         )
         side = max(1, int(np.ceil(np.sqrt(n_nodes))))
+
+        def _color_opts(raw):
+            """Цвет заливки + контрастный текст внутри узла."""
+            name = str(raw or 'grey').lower()
+            palette = {
+                'red': ('#e74c3c', '#ffffff'),
+                'black': ('#2c3e50', '#ffffff'),
+                'grey': ('#bdc3c7', '#1a1a1a'),
+                'gray': ('#bdc3c7', '#1a1a1a'),
+            }
+            bg, fg = palette.get(name, (name, '#1a1a1a'))
+            return {
+                'background': bg,
+                'border': bg,
+                'highlight': {'background': bg, 'border': '#111'},
+            }, fg
+
+        def _inner_label(text: str) -> str:
+            """Разбить подпись на 2 строки, чтобы влезала внутрь ellipse."""
+            parts = str(text).split()
+            if len(parts) <= 1:
+                return str(text)
+            if len(parts) == 2:
+                return f'{parts[0]}\n{parts[1]}'
+            return f'{" ".join(parts[:-1])}\n{parts[-1]}'
 
         with open(html_path, 'w', encoding='utf-8') as fh:
             fh.write(
@@ -1153,20 +1222,30 @@ def visualize():
                 attrs = graph.nodes[node]
                 label = str(attrs.get('label') or node)
                 title = str(attrs.get('title') or label)
+                color_opts, font_color = _color_opts(attrs.get('color', 'grey'))
                 item = {
                     'id': str(node),
-                    'label': label,
+                    'label': _inner_label(label),
                     'title': title,
-                    'shape': 'dot',
-                    'size': 12,
-                    'color': attrs.get('color', 'grey'),
+                    'shape': 'ellipse',
+                    'color': color_opts,
+                    'font': {
+                        'size': 11,
+                        'face': 'Arial',
+                        'color': font_color,
+                        'align': 'center',
+                        'multi': True,
+                    },
+                    'margin': 12,
+                    'widthConstraint': {'maximum': 160},
+                    'heightConstraint': {'minimum': 36},
                 }
                 if use_physics:
                     item['physics'] = True
                 else:
                     item['physics'] = False
-                    item['x'] = float(i % side) * 120.0
-                    item['y'] = float(i // side) * 80.0
+                    item['x'] = float(i % side) * 160.0
+                    item['y'] = float(i // side) * 90.0
                 if not first:
                     fh.write(',\n')
                 first = False
@@ -1199,7 +1278,9 @@ def visualize():
                 '\n]);\n'
                 'new vis.Network(document.getElementById("m"),{nodes,edges},{'
                 f'{phys_js}'
-                'nodes:{shape:"dot",size:12,font:{size:11,face:"Arial",color:"#222"}},'
+                'nodes:{shape:"ellipse",margin:12,'
+                'font:{size:11,face:"Arial",align:"center",multi:true},'
+                'widthConstraint:{maximum:160},scaling:{label:false}},'
                 'edges:{font:{size:9,align:"middle",color:"#444"},'
                 'smooth:{type:"continuous"}},'
                 'interaction:{dragNodes:true,dragView:true,zoomView:true,hover:true}'
@@ -1341,22 +1422,34 @@ def visualize():
         save_gephi(G, f'Group_visualisation{group}')
 
         components = sorted(nx.connected_components(G), key=len, reverse=True)
-        # Папка только если реально несколько компонент
-        if len(components) > 1:
+        # На диск — только компоненты ≥ bound (иначе после среза хабов будет десятки тысяч файлов)
+        export_comps = [c for c in components if len(c) >= bound]
+        skipped = len(components) - len(export_comps)
+        if skipped:
+            log(
+                f'HTML: пишем {len(export_comps)} комп. (≥{bound}), '
+                f'пропуск мелких: {skipped}',
+                level='info',
+            )
+        if not export_comps:
+            log('нет компонент ≥ bound для HTML', level='warn')
+            continue
+
+        if len(export_comps) > 1:
             html_dir = os.path.join(HTML_DIR, f'group_{group}')
             os.makedirs(html_dir, exist_ok=True)
         else:
             html_dir = HTML_DIR
             os.makedirs(html_dir, exist_ok=True)
 
-        for comp_i, comp in enumerate(components):
+        for comp_i, comp in enumerate(export_comps):
             sub = G.subgraph(comp).copy()
-            if len(components) > 1:
+            if len(export_comps) > 1:
                 html_name = f'{group}_{comp_i}.html'
             else:
                 html_name = f'Group_visualisation{group}.html'
             save_html(sub, os.path.join(html_dir, html_name))
-        log(f'HTML-компонент: {len(components)}', level='info')
+        log(f'HTML записано: {len(export_comps)}', level='info')
 
     log(f'Gephi → {GEPHI_DIR}', level='ok')
     log(f'HTML  → {HTML_DIR}', level='ok')
