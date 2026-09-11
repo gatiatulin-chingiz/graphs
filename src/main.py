@@ -16,12 +16,17 @@ wrong_people_val = config.wrong_people_val
 wrong_auto_val = config.wrong_auto_val
 bound = config.bound
 
+
+def _viz_top_n() -> int:
+    """Сколько крупнейших групп рисовать (из config, при каждом вызове)."""
+    return max(1, int(getattr(config, 'viz_top_n', 200)))
+
+
 VARS_DIR = './vars'
 OUTPUT_DIR = './output'
 GEPHI_DIR = os.path.join(OUTPUT_DIR, 'gephi')
 HTML_DIR = os.path.join(OUTPUT_DIR, 'html')
 FINGERPRINT_PATH = os.path.join(VARS_DIR, 'input_fingerprint.json')
-VIZ_TOP_N = 200
 # Ниже этого порога — подробные title на рёбрах; выше — быстрая стилизация
 DETAILED_STYLE_MAX_EDGES = 50_000
 MAX_RELABEL_NODES = 10_000
@@ -52,9 +57,25 @@ def ensure_artifact_dirs():
         os.makedirs(path, exist_ok=True)
 
 
-def log(msg: str) -> None:
-    """Короткий лог шага пайплайна (без лишнего шума)."""
-    print(msg, flush=True)
+def log(msg: str = '', *, level: str = 'info') -> None:
+    """Единый формат логов пайплайна."""
+    prefixes = {
+        'header': '',
+        'step': '▸ ',
+        'ok': '✓ ',
+        'info': '  · ',
+        'warn': '⚠ ',
+        'err': '✗ ',
+    }
+    prefix = prefixes.get(level, '  · ')
+    if level == 'header':
+        line = '─' * 44
+        print(f'\n{line}\n  {msg}\n{line}', flush=True)
+        return
+    if level == 'step':
+        print(f'\n{prefix}{msg}', flush=True)
+        return
+    print(f'{prefix}{msg}', flush=True)
 
 
 def _list_input_files():
@@ -115,7 +136,7 @@ def try_load_cached_artifacts():
     old = _load_fingerprint()
     if old != fingerprint:
         return False, fingerprint
-    log('[cache] вход не изменился — гружу ./vars')
+    log('вход не изменился — загружаю ./vars', level='ok')
     load_objects()
     load_links()
     load_statistics()
@@ -126,25 +147,28 @@ def run_pipeline():
     """Пайплайн: кэш или пересчёт → статистика/Gephi/HTML. Без GUI в ноутбуке.
 
     В Jupyter вызывайте ``run_pipeline()``, не ``run()`` (конфликт с ``%run``).
+    Число групп для отрисовки: ``config.viz_top_n``.
     """
-    log('=== Пайплайн графов ===')
+    top_n = _viz_top_n()
+    log('Пайплайн графов', level='header')
+    log(f'viz_top_n = {top_n}', level='info')
     ensure_artifact_dirs()
     clear_graph_outputs()
     ensure_artifact_dirs()
     cached, fingerprint = try_load_cached_artifacts()
     if not cached:
-        log('[1/4] загрузка и предобработка Excel')
+        log('1/4  Загрузка и предобработка Excel', level='step')
         load()
-        log('[2/4] связи')
+        log('2/4  Построение связей', level='step')
         create_links()
-        log('[3/4] статистика → ./output/statistics.xlsx')
+        log('3/4  Статистика → ./output/statistics.xlsx', level='step')
         create_statistics()
         _save_fingerprint(fingerprint)
     else:
-        log('[1-3/4] пропуск пересчёта (кэш)')
-    log('[4/4] Gephi + HTML (по компонентам)')
+        log('1–3/4  Пересчёт пропущен (кэш)', level='ok')
+    log(f'4/4  Gephi + HTML (топ-{top_n} групп)', level='step')
     visualize()
-    log('=== Готово ===')
+    log('Готово', level='ok')
 
 
 # Для скриптов; в ноутбуке используйте run_pipeline()
@@ -306,12 +330,12 @@ def choice_query():
     ]
     if not onlyfiles:
         raise FileNotFoundError('В рабочей папке нет xlsx/xls-файлов')
-    log(f'  Excel: {", ".join(onlyfiles)}')
+    log(f'Excel: {", ".join(onlyfiles)}', level='info')
     max_workers = min(4, len(onlyfiles))
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         frames = list(pool.map(pd.read_excel, onlyfiles))
     data = pd.concat(frames, axis=0, ignore_index=True)
-    log(f'  строк: {len(data):,}')
+    log(f'строк: {len(data):,}', level='info')
     preprocessing()
 
 # Препроцессинг
@@ -358,7 +382,7 @@ def preprocessing():
               VIN_cul_col, VIN_vic_col, \
               Filial_col, Reject_col, Sum_col, FIO_vic_pol_col, BD_vic_pol_col]:
         if i not in data.columns:
-            log(f'Столбца {i} нет в данных ❌')
+            log(f'нет столбца: {i}', level='err')
             error = 1
     if error == 1:
         return -1
@@ -640,7 +664,7 @@ def preprocessing():
                  FIO_pol_driv_col, BD_pol_driv_col, \
                  FIO_ref_rec, BD_ref_rec, \
                  VIN_cul_col, VIN_vic_col, Filial_col, Reject_col, Sum_col, FIO_vic_pol_col, BD_vic_pol_col], open("./vars/columns",'wb'))  
-    log(f'  объекты: {len(objects):,}, people: {len(people):,}')
+    log(f'объекты: {len(objects):,}  |  people: {len(people):,}', level='info')
 
 def load_objects():
     global data, people, VIN, objects
@@ -665,7 +689,7 @@ def load_objects():
     FIO_pol_driv_col, BD_pol_driv_col = temp[13], temp[14]
     FIO_ref_rec, BD_ref_rec = temp[15], temp[16]
     VIN_cul_col, VIN_vic_col, Filial_col, Reject_col, Sum_col, FIO_vic_pol_col, BD_vic_pol_col = temp[17], temp[18], temp[19], temp[20], temp[21], temp[22], temp[23]
-    log(f'  из vars: data={len(data):,}')
+    log(f'из vars: data={len(data):,}', level='info')
     
 def create_links():
     global data, people, VIN, objects, links
@@ -700,13 +724,13 @@ def create_links():
              pd.DataFrame(columns=['obj1', 'obj2', 'Loss_idx', 'link_type']))
     ensure_artifact_dirs()
     pickle.dump(links, open('./vars/links', 'wb'))
-    log(f'  связей: {len(links):,}')
+    log(f'связей: {len(links):,}', level='info')
     
 def load_links():
     global links
     
     links = pickle.load(open('./vars/links', 'rb'))
-    log(f'  связей из vars: {len(links):,}')
+    log(f'связей из vars: {len(links):,}', level='info')
 
 def create_statistics():
     global links, data, big_groups, stat, objects, bound
@@ -777,7 +801,7 @@ def create_statistics():
 
     with pd.ExcelWriter('./output/statistics.xlsx', engine='xlsxwriter') as writer:
         stat.to_excel(writer, index=False, sheet_name='statistics')
-    log(f'  big_groups: {len(big_groups)}, файл: ./output/statistics.xlsx')
+    log(f'big_groups: {len(big_groups)}  →  ./output/statistics.xlsx', level='info')
     
     
 def load_statistics():
@@ -789,7 +813,7 @@ def load_statistics():
     stat = pickle.load(open('./vars/stat', 'rb'))
     big_groups = [i for i in groups if len(i) > bound]
     objects = pd.DataFrame(objects)
-    log(f'  big_groups из vars: {len(big_groups)}')
+    log(f'big_groups из vars: {len(big_groups)}', level='info')
         
 def visualize():
     global links, data, big_groups, objects, people, VIN, ID_col
@@ -979,7 +1003,7 @@ def visualize():
                 G[left][right].update(color='red', weight=4, width=4, title=title)
 
     objects = pd.DataFrame(objects)
-    n_groups = len(big_groups[:VIZ_TOP_N])
+    n_groups = len(big_groups[:_viz_top_n()])
     people_len = len(people)
 
     for group in range(n_groups):
@@ -990,7 +1014,10 @@ def visualize():
         G = nx.from_pandas_edgelist(sub_links, 'obj1', 'obj2', create_using=nx.Graph())
         G.remove_edges_from(nx.selfloop_edges(G))
         n_nodes, n_edges = G.number_of_nodes(), G.number_of_edges()
-        log(f'  группа {group}/{n_groups - 1}: {n_nodes:,} узлов, {n_edges:,} рёбер')
+        log(
+            f'группа {group + 1}/{n_groups}:  {n_nodes:,} узлов, {n_edges:,} рёбер',
+            level='info',
+        )
 
         style_graph(G, sub_links, people_len)
 
@@ -1018,6 +1045,7 @@ def visualize():
             else:
                 html_name = f'Group_visualisation{group}.html'
             save_html(sub, os.path.join(html_dir, html_name))
-        log(f'    → gephi + HTML компонент: {len(components)}')
+        log(f'HTML-компонент: {len(components)}', level='info')
 
-    log(f'  итог: Gephi в {GEPHI_DIR}, HTML в {HTML_DIR}')
+    log(f'Gephi → {GEPHI_DIR}', level='ok')
+    log(f'HTML  → {HTML_DIR}', level='ok')
