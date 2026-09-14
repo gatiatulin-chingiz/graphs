@@ -19,15 +19,13 @@ bound = config.bound
 
 _WORD_CHAR = r'0-9A-Za-zА-Яа-яЁё'
 
+# Кэш скомпилированных regex для hub_keywords: tuple(kws) -> list[Pattern]
+_KEYWORD_PATTERN_CACHE: dict[tuple, list] = {}
+
 
 def _viz_top_n() -> int:
     """Сколько крупнейших групп рисовать (из config, при каждом вызове)."""
     return max(1, int(getattr(config, 'viz_top_n', 200)))
-
-
-def _hub_degree_n() -> int:
-    """Порог degree > N; 0 = фильтр по степени выключен."""
-    return max(0, int(getattr(config, 'hub_degree_n', 0)))
 
 
 def _normalize_keyword(kw: str) -> str:
@@ -41,9 +39,7 @@ def _normalize_keyword(kw: str) -> str:
 
 def _hub_keywords():
     """Ключевые слова whitelist (нормализованные, без пустых/дублей)."""
-    raw = getattr(config, 'hub_keywords', None)
-    if raw is None:
-        raw = getattr(config, 'legal_forms_remove', None) or []
+    raw = getattr(config, 'hub_keywords', None) or []
     seen = set()
     out = []
     for item in raw:
@@ -53,6 +49,25 @@ def _hub_keywords():
         seen.add(norm)
         out.append(norm)
     return out
+
+
+def _keyword_patterns(keywords=None):
+    """Скомпилированные границы целого слова/фразы (с кэшем)."""
+    kws = tuple(keywords if keywords is not None else _hub_keywords())
+    cached = _KEYWORD_PATTERN_CACHE.get(kws)
+    if cached is not None:
+        return cached
+    patterns = []
+    for phrase in kws:
+        if not phrase:
+            continue
+        patterns.append(re.compile(
+            rf'(?<![{_WORD_CHAR}])'
+            + re.escape(phrase)
+            + rf'(?![{_WORD_CHAR}])'
+        ))
+    _KEYWORD_PATTERN_CACHE[kws] = patterns
+    return patterns
 
 
 def _clean_entity_label(label) -> str:
@@ -65,29 +80,20 @@ def _clean_entity_label(label) -> str:
     return text
 
 
-def label_matches_keywords(label, keywords) -> bool:
+def label_matches_keywords(label, keywords=None) -> bool:
     """
     Регистронезависимое совпадение целого слова/фразы из keywords.
 
     'ооо' → ООО "Ромашка" да; ПОООРФЕНОВ — нет.
+    keywords=None → берётся hub_keywords из config.
     """
-    if not keywords:
+    patterns = _keyword_patterns(keywords)
+    if not patterns:
         return False
     text = _clean_entity_label(label).casefold()
     if not text:
         return False
-    for kw in keywords:
-        phrase = _normalize_keyword(kw)
-        if not phrase:
-            continue
-        pattern = (
-            rf'(?<![{_WORD_CHAR}])'
-            + re.escape(phrase)
-            + rf'(?![{_WORD_CHAR}])'
-        )
-        if re.search(pattern, text):
-            return True
-    return False
+    return any(p.search(text) for p in patterns)
 
 
 def _node_label(objects_df: pd.DataFrame, node) -> str:
@@ -97,53 +103,11 @@ def _node_label(objects_df: pd.DataFrame, node) -> str:
         return _clean_entity_label(node)
 
 
-def collect_cut_nodes(graph: nx.Graph, objects_df: pd.DataFrame,
-                      degree_n=None, keywords=None):
-    """
-    Узлы к удалению по правилам среза.
-
-    - топ-хабы: degree > degree_n (если degree_n > 0), иначе все узлы;
-    - если keywords непусты: seed = топ-хабы с совпадением по ключу;
-      удаляем seed + всех соседей (рёбра уходят вместе с вершинами);
-    - если keywords пусты: удаляем только сами топ-хабы (без соседей).
-    """
-    if degree_n is None:
-        degree_n = _hub_degree_n()
-    if keywords is None:
-        keywords = _hub_keywords()
-    if graph.number_of_nodes() == 0:
-        return set(), set()
-
-    deg = dict(graph.degree())
-    if degree_n > 0:
-        tops = {n for n, d in deg.items() if d > degree_n}
-    else:
-        tops = set(graph.nodes)
-
-    if keywords:
-        seeds = {
-            n for n in tops
-            if label_matches_keywords(_node_label(objects_df, n), keywords)
-        }
-        remove = set(seeds)
-        for seed in seeds:
-            remove.update(graph.neighbors(seed))
-        return remove, seeds
-
-    # без ключевых слов — классический срез только хабов по степени
-    return set(tops), set(tops)
-
-
 VARS_DIR = './vars'
 OUTPUT_DIR = './output'
 GEPHI_DIR = os.path.join(OUTPUT_DIR, 'gephi')
 HTML_DIR = os.path.join(OUTPUT_DIR, 'html')
 FINGERPRINT_PATH = os.path.join(VARS_DIR, 'input_fingerprint.json')
-# Ниже этого порога — подробные title на рёбрах; выше — быстрая стилизация
-DETAILED_STYLE_MAX_EDGES = 50_000
-# Physics / spring только на малых компонентах (иначе снова зависания)
-PHYSICS_MAX_NODES = 400
-PHYSICS_MAX_EDGES = 2_000
 REQUIRED_ARTIFACTS = (
     'data', 'people', 'VIN', 'objects', 'columns',
     'links', 'G', 'groups', 'stat',
@@ -257,22 +221,21 @@ def try_load_cached_artifacts():
 def run_pipeline(*, draw: bool = False):
     """Пайплайн: кэш или пересчёт → статистика. Отрисовка — отдельно.
 
-    По умолчанию ``draw=False``: сначала смотрите ``show_degree_report()``,
-    затем вызывайте ``visualize()`` (иначе на диск улетит куча HTML).
+    По умолчанию ``draw=False``. Дальше в ноутбуке:
+    ``show_hub_audit()`` → ``show_fraud_candidates()`` → ``visualize_fraud()``.
 
     В Jupyter: ``run_pipeline()``, не ``run()`` (конфликт с ``%run``).
     """
-    top_n = _viz_top_n()
     keywords = _hub_keywords()
     log('Пайплайн графов', level='header')
-    log(f'viz_top_n = {top_n}', level='info')
-    log(f'hub_degree_n = {_hub_degree_n()}', level='info')
+    log(f'viz_top_n = {_viz_top_n()}', level='info')
+    log(f'suspect_degree_n = {int(getattr(config, "suspect_degree_n", 20))}', level='info')
     log(
-        f'hub_keywords = {len(keywords)} шт.'
+        f'hub_keywords (whitelist) = {len(keywords)} шт.'
         + (
             f' ({", ".join(keywords[:6])}…)'
             if len(keywords) > 6
-            else (f' ({", ".join(keywords)})' if keywords else ' (выкл. → только degree)')
+            else (f' ({", ".join(keywords)})' if keywords else '')
         ),
         level='info',
     )
@@ -288,53 +251,24 @@ def run_pipeline(*, draw: bool = False):
         _save_fingerprint(fingerprint)
     else:
         log('1–3/3  Пересчёт пропущен (кэш)', level='ok')
-    log_cut_preview(group_index=0)
+    try:
+        from .fraud import clear_fraud_cache
+        clear_fraud_cache()
+    except Exception:
+        pass
     if draw:
-        log(f'отрисовка Gephi + HTML (топ-{top_n})', level='step')
+        log('отрисовка fraud HTML', level='step')
         visualize()
         log('Готово', level='ok')
     else:
-        mode = str(getattr(config, 'cluster_mode', 'fraud'))
-        if mode == 'fraud':
-            log(
-                'дальше: show_hub_audit() → show_fraud_candidates() → visualize_fraud()',
-                level='ok',
-            )
-        else:
-            log(
-                'дальше: show_degree_report() → visualize() [legacy]',
-                level='ok',
-            )
+        log(
+            'дальше: show_hub_audit() → show_fraud_candidates() → visualize_fraud()',
+            level='ok',
+        )
 
 
 # Для скриптов; в ноутбуке используйте run_pipeline()
 run = run_pipeline
-
-
-def log_cut_preview(group_index: int = 0) -> None:
-    """Краткий лог: сколько компонент будет после среза (без записи на диск)."""
-    try:
-        ensure_runtime_state()
-        graph = _subgraph_for_group(group_index)
-        objects_df = pd.DataFrame(objects)
-        before_n = graph.number_of_nodes()
-        before_cc = nx.number_connected_components(graph)
-        cut, info = apply_group_cuts(graph, objects_df)
-        log(
-            f'превью среза группы {group_index}: '
-            f'{before_n:,} узлов / {before_cc} комп. → '
-            f'{info["nodes_left"]:,} узлов / {info["components"]:,} комп. '
-            f'(seed-хабов−{info["removed_seeds"]}, с соседями−{info["removed_total"]})',
-            level='info',
-        )
-        if info['components'] > 500:
-            log(
-                'компонент очень много — сначала отчёт и пороги, '
-                'visualize() пишет только компоненты размером ≥ bound',
-                level='warn',
-            )
-    except Exception as exc:
-        log(f'превью среза недоступно: {exc}', level='warn')
 
 
 def ensure_runtime_state():
@@ -368,199 +302,6 @@ def _subgraph_for_group(group_index: int = 0) -> nx.Graph:
     graph = nx.from_pandas_edgelist(sub_links, 'obj1', 'obj2', create_using=nx.Graph())
     graph.remove_edges_from(nx.selfloop_edges(graph))
     return graph
-
-
-def degree_report(group_index: int = 0, top_n: int = 40):
-    """
-    Таблицы для подбора hub_degree_n и hub_keywords.
-
-    Топ-хабов — уже ПОСЛЕ среза (кто остался).
-    Возвращает (summary, top_hubs, cut_scenarios, config_result).
-    """
-    ensure_runtime_state()
-    graph = _subgraph_for_group(group_index)
-    people_count = len(people)
-    objects_df = pd.DataFrame(objects)
-    keywords = _hub_keywords()
-    degree_n = _hub_degree_n()
-
-    def _label(i):
-        return _node_label(objects_df, i)
-
-    def _node_kind(i, label: str) -> str:
-        if i >= people_count:
-            return 'VIN'
-        if label_matches_keywords(label, keywords):
-            return 'keyword-hit'
-        return 'человек'
-
-    deg = pd.Series(dict(graph.degree()), name='degree')
-    if deg.empty:
-        empty = pd.DataFrame()
-        return empty, empty, empty, empty
-
-    labels = {i: _label(i) for i in deg.index}
-    remove_set, seeds = collect_cut_nodes(graph, objects_df)
-
-    def _pct(p):
-        return float(np.percentile(deg.to_numpy(), p))
-
-    p90, p95, p99 = _pct(90), _pct(95), _pct(99)
-    mean_d = float(deg.mean())
-    std_d = float(deg.std(ddof=0)) if len(deg) > 1 else 0.0
-    mean_2std = mean_d + 2 * std_d
-    n_cc_now = nx.number_connected_components(graph)
-
-    summary = pd.DataFrame(
-        [
-            ('group_index', int(group_index)),
-            ('узлов', int(graph.number_of_nodes())),
-            ('рёбер', int(graph.number_of_edges())),
-            ('компонент сейчас', int(n_cc_now)),
-            ('hub_keywords (шт.)', int(len(keywords))),
-            ('seed-хабов к срезу', int(len(seeds))),
-            ('узлов к срезу (хаб+соседи)', int(len(remove_set))),
-            ('degree min', int(deg.min())),
-            ('degree median', round(float(deg.median()), 2)),
-            ('degree mean', round(mean_d, 2)),
-            ('degree std', round(std_d, 2)),
-            ('degree p90', round(p90, 2)),
-            ('degree p95', round(p95, 2)),
-            ('degree p99', round(p99, 2)),
-            ('degree max', int(deg.max())),
-            ('mean+2std', round(mean_2std, 2)),
-        ],
-        columns=['метрика', 'значение'],
-    )
-
-    def _apply_remove(base_graph, nodes_to_drop):
-        H = base_graph.copy()
-        drop = [n for n in nodes_to_drop if n in H]
-        H.remove_nodes_from(drop)
-        removed = len(drop)
-        if H.number_of_nodes() == 0:
-            return {
-                'снято узлов': removed,
-                'компонент после': 0,
-                'размер топ-1': 0,
-                'размер топ-5 (сумма)': 0,
-            }, H
-        comps = sorted(nx.connected_components(H), key=len, reverse=True)
-        return {
-            'снято узлов': removed,
-            'компонент после': len(comps),
-            'размер топ-1': len(comps[0]),
-            'размер топ-5 (сумма)': sum(len(c) for c in comps[:5]),
-        }, H
-
-    cfg_stats, graph_after = _apply_remove(graph, remove_set)
-    config_result = pd.DataFrame(
-        [
-            ('hub_degree_n (config)', degree_n),
-            ('hub_keywords (шт.)', len(keywords)),
-            ('seed-хабов', len(seeds)),
-            ('снято узлов (хаб+соседи)', cfg_stats['снято узлов']),
-            ('компонент после среза', cfg_stats['компонент после']),
-            ('размер топ-1 после среза', cfg_stats['размер топ-1']),
-            ('размер топ-5 (сумма)', cfg_stats['размер топ-5 (сумма)']),
-        ],
-        columns=['параметр', 'значение'],
-    )
-
-    if graph_after.number_of_nodes():
-        deg_after = pd.Series(dict(graph_after.degree()), name='degree')
-        top_hubs = (
-            deg_after.sort_values(ascending=False)
-            .head(top_n)
-            .rename_axis('obj_idx')
-            .reset_index()
-        )
-        top_hubs['метка'] = top_hubs['obj_idx'].map(lambda i: labels.get(i, _label(i)))
-        top_hubs['тип'] = [
-            _node_kind(i, labels.get(i, _label(i))) for i in top_hubs['obj_idx']
-        ]
-        top_hubs = top_hubs[['obj_idx', 'degree', 'тип', 'метка']]
-    else:
-        top_hubs = pd.DataFrame(columns=['obj_idx', 'degree', 'тип', 'метка'])
-
-    scenarios = []
-    for name, thr in [
-        ('только keywords', 0),
-        ('p90', p90),
-        ('p95', p95),
-        ('p99', p99),
-        ('mean+2std', mean_2std),
-        ('degree>50', 50),
-        ('degree>100', 100),
-        ('degree>200', 200),
-        ('degree>500', 500),
-        ('config hub_degree_n', degree_n),
-    ]:
-        thr_i = int(np.floor(thr))
-        for use_kw, kw_tag in [(False, 'keywords: нет'), (True, 'keywords: да')]:
-            if name == 'только keywords' and not use_kw:
-                continue
-            if name == 'только keywords' and not keywords:
-                continue
-            if use_kw:
-                dn = 0 if name == 'только keywords' else thr_i
-                drop, _ = collect_cut_nodes(
-                    graph, objects_df, degree_n=dn, keywords=keywords,
-                )
-            else:
-                drop, _ = collect_cut_nodes(
-                    graph, objects_df, degree_n=thr_i, keywords=[],
-                )
-            stats, _ = _apply_remove(graph, drop)
-            scenarios.append({
-                'сценарий': name,
-                'keywords': kw_tag,
-                'порог N (degree > N)': 0 if name == 'только keywords' else thr_i,
-                **stats,
-            })
-    cut_scenarios = pd.DataFrame(scenarios)
-    return summary, top_hubs, cut_scenarios, config_result
-
-
-def show_degree_report(group_index: int = 0, top_n: int = 40):
-    """Краткий отчёт в Jupyter: итог по config + сценарии (с числом компонент)."""
-    from IPython.display import display, Markdown
-
-    summary, top_hubs, cut_scenarios, config_result = degree_report(
-        group_index, top_n=top_n,
-    )
-    cfg_n = _hub_degree_n()
-    keywords = _hub_keywords()
-    n_cc = int(config_result.loc[
-        config_result['параметр'] == 'компонент после среза', 'значение'
-    ].iloc[0]) if len(config_result) else 0
-    top1 = int(config_result.loc[
-        config_result['параметр'] == 'размер топ-1 после среза', 'значение'
-    ].iloc[0]) if len(config_result) else 0
-    kw_preview = ', '.join(keywords[:8]) + ('…' if len(keywords) > 8 else '')
-
-    display(Markdown(
-        f'### Краткий итог по `config` (группа {group_index})\n'
-        f'- `hub_degree_n` = **{cfg_n}**\n'
-        f'- `hub_keywords` = **{len(keywords)}**'
-        f'{f" (`{kw_preview}`)" if keywords else " (пусто → режем только хабы по degree)"}\n'
-        f'- после среза: **{n_cc:,}** компонент, топ-1 = **{top1:,}** узлов\n'
-        f'- срез: топ-хабы по ключу + **все их соседи**; регистр ключей не важен'
-    ))
-    display(config_result)
-    display(Markdown(
-        '### Сценарии среза '
-        '(колонка **«компонент после»** — сколько кусков получится)'
-    ))
-    display(cut_scenarios)
-    display(Markdown('### Сводка по группе (до среза)'))
-    display(summary)
-    display(Markdown(
-        f'### Топ-{top_n} хабов **после** среза (удалённые не показываем)'
-    ))
-    display(top_hubs)
-    return summary, top_hubs, cut_scenarios, config_result
-
 
 
 def load():
@@ -1060,407 +801,10 @@ def load_statistics():
     objects = pd.DataFrame(objects)
     log(f'big_groups из vars: {len(big_groups)}', level='info')
         
-def apply_group_cuts(graph: nx.Graph, objects_df: pd.DataFrame):
-    """
-    Срез по config: топ-хабы (degree > N) по hub_keywords + их соседи.
-
-    Если keywords пусты — удаляются только сами хабы по степени.
-    """
-    H = graph.copy()
-    remove, seeds = collect_cut_nodes(H, objects_df)
-    if remove:
-        H.remove_nodes_from([n for n in remove if n in H])
-    n_cc = nx.number_connected_components(H) if H.number_of_nodes() else 0
-    info = {
-        'removed_seeds': len(seeds),
-        'removed_total': len(remove),
-        'removed_orgs': len(seeds),  # alias для старых логов
-        'removed_hubs': max(0, len(remove) - len(seeds)),
-        'nodes_left': H.number_of_nodes(),
-        'components': n_cc,
-    }
-    return H, info
-
-
 def visualize():
-    global links, data, big_groups, objects, people, VIN, ID_col
-
-    mode = str(getattr(config, 'cluster_mode', 'fraud'))
-    if mode == 'fraud':
-        from .fraud import visualize_fraud
-        return visualize_fraud(group_index=0)
-
-    ensure_runtime_state()
-    ensure_artifact_dirs()
-    clear_graph_outputs()
-    ensure_artifact_dirs()
-    log('Отрисовка Gephi/HTML (legacy)', level='header')
-    log_cut_preview(group_index=0)
-
-    def loss_text(loss_ids, limit=3):
-        """До ``limit`` номеров убытков через запятую (для title/label рёбер)."""
-        if not loss_ids:
-            return ''
-        try:
-            unique_ids = list(pd.unique(data.loc[loss_ids, ID_col]))[:limit]
-        except Exception:
-            return ''
-        return ', '.join(str(v) for v in unique_ids if pd.notna(v))
-
-    def short_person_label(full_text: str) -> str:
-        """Фамилия + инициалы + дата рождения; VIN оставляем как есть."""
-        raw = str(full_text).strip()
-        if not raw or raw.lower() in ('nan', 'none', 'nat'):
-            return raw
-        parts = raw.split()
-        if not parts:
-            return raw
-        bd = ''
-        name_parts = parts
-        last = parts[-1]
-        if len(last) >= 8 and (('-' in last) or ('.' in last) or last.isdigit()):
-            if last.lower() not in ('nan', 'nat', 'none'):
-                bd = last[:10]
-            name_parts = parts[:-1]
-        if not name_parts:
-            return bd or raw
-        # VIN / короткий код без пробелов ФИО
-        if len(name_parts) == 1 and len(name_parts[0]) <= 20 and not name_parts[0].isalpha():
-            return name_parts[0] + (f' {bd}' if bd else '')
-        surname = name_parts[0].capitalize()
-        initials = ''.join(
-            f'{p[0].upper()}.' for p in name_parts[1:3] if p
-        )
-        short = surname + (f' {initials}' if initials else '')
-        if bd:
-            short = f'{short} {bd}'
-        return short
-
-    def node_labels(obj_idx, people_len):
-        """Полное имя (title) и короткое (label) для узла."""
-        try:
-            full = str(objects.loc[obj_idx, 0])
-        except Exception:
-            full = str(obj_idx)
-        if obj_idx >= people_len:
-            short = full if len(full) <= 17 else full[:17]
-            return full, short
-        return full, short_person_label(full)
-
-    def _sanitize_for_gexf(graph):
-        """Строковые атрибуты; weight всегда > 0 (иначе Gephi дропает рёбра)."""
-        H = graph.copy()
-        for node in H.nodes:
-            for key, value in list(H.nodes[node].items()):
-                if key in ('x', 'y', 'physics', 'width'):
-                    H.nodes[node].pop(key, None)
-                    continue
-                H.nodes[node][key] = '' if value is None else str(value)
-        for _u, _v, attrs in H.edges(data=True):
-            for key, value in list(attrs.items()):
-                if key == 'weight':
-                    try:
-                        w = float(value)
-                    except (TypeError, ValueError):
-                        w = 1.0
-                    attrs[key] = max(w, 1.0)
-                    continue
-                if key == 'width':
-                    attrs.pop(key, None)
-                    continue
-                attrs[key] = '' if value is None else str(value)
-            if 'weight' not in attrs:
-                attrs['weight'] = 1.0
-            # Gephi показывает Label; title дублируем в label, если label пуст
-            if not attrs.get('label') and attrs.get('title'):
-                attrs['label'] = attrs['title']
-        return H
-
-    def save_html(graph, html_path):
-        """HTML: подпись ФИО/VIN внутри фигуры узла (ellipse), title на hover."""
-        if graph.number_of_nodes() == 0:
-            return
-        parent = os.path.dirname(html_path)
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-
-        n_nodes = graph.number_of_nodes()
-        n_edges = graph.number_of_edges()
-        use_physics = (
-            n_nodes <= PHYSICS_MAX_NODES and n_edges <= PHYSICS_MAX_EDGES
-        )
-        side = max(1, int(np.ceil(np.sqrt(n_nodes))))
-
-        def _color_opts(raw):
-            """Цвет заливки + контрастный текст внутри узла."""
-            name = str(raw or 'grey').lower()
-            palette = {
-                'red': ('#e74c3c', '#ffffff'),
-                'black': ('#2c3e50', '#ffffff'),
-                'grey': ('#bdc3c7', '#1a1a1a'),
-                'gray': ('#bdc3c7', '#1a1a1a'),
-            }
-            bg, fg = palette.get(name, (name, '#1a1a1a'))
-            return {
-                'background': bg,
-                'border': bg,
-                'highlight': {'background': bg, 'border': '#111'},
-            }, fg
-
-        def _inner_label(text: str) -> str:
-            """Разбить подпись на 2 строки, чтобы влезала внутрь ellipse."""
-            parts = str(text).split()
-            if len(parts) <= 1:
-                return str(text)
-            if len(parts) == 2:
-                return f'{parts[0]}\n{parts[1]}'
-            return f'{" ".join(parts[:-1])}\n{parts[-1]}'
-
-        with open(html_path, 'w', encoding='utf-8') as fh:
-            fh.write(
-                '<!DOCTYPE html><html><head><meta charset="utf-8">'
-                '<script src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js">'
-                '</script>'
-                '<style>html,body,#m{margin:0;height:100%;width:100%;}</style>'
-                '</head><body><div id="m"></div><script>\n'
-                'const nodes=new vis.DataSet([\n'
-            )
-            first = True
-            for i, node in enumerate(graph.nodes):
-                attrs = graph.nodes[node]
-                label = str(attrs.get('label') or node)
-                title = str(attrs.get('title') or label)
-                color_opts, font_color = _color_opts(attrs.get('color', 'grey'))
-                item = {
-                    'id': str(node),
-                    'label': _inner_label(label),
-                    'title': title,
-                    'shape': 'ellipse',
-                    'color': color_opts,
-                    'font': {
-                        'size': 11,
-                        'face': 'Arial',
-                        'color': font_color,
-                        'align': 'center',
-                        'multi': True,
-                    },
-                    'margin': 12,
-                    'widthConstraint': {'maximum': 160},
-                    'heightConstraint': {'minimum': 36},
-                }
-                if use_physics:
-                    item['physics'] = True
-                else:
-                    item['physics'] = False
-                    item['x'] = float(i % side) * 160.0
-                    item['y'] = float(i // side) * 90.0
-                if not first:
-                    fh.write(',\n')
-                first = False
-                json.dump(item, fh, ensure_ascii=False)
-            fh.write('\n]);\nconst edges=new vis.DataSet([\n')
-            first = True
-            for u, v, attrs in graph.edges(data=True):
-                edge_title = str(attrs.get('title') or '')
-                edge_label = str(attrs.get('label') or edge_title)
-                item = {
-                    'from': str(u),
-                    'to': str(v),
-                    'color': attrs.get('color', '#999'),
-                    'width': int(float(attrs.get('width', 1) or 1)),
-                }
-                if edge_label:
-                    item['label'] = edge_label
-                if edge_title:
-                    item['title'] = edge_title
-                if not first:
-                    fh.write(',\n')
-                first = False
-                json.dump(item, fh, ensure_ascii=False)
-            phys_js = (
-                'physics:{enabled:true,stabilization:{iterations:200}},'
-                if use_physics
-                else 'physics:{enabled:false},'
-            )
-            fh.write(
-                '\n]);\n'
-                'new vis.Network(document.getElementById("m"),{nodes,edges},{'
-                f'{phys_js}'
-                'nodes:{shape:"ellipse",margin:12,'
-                'font:{size:11,face:"Arial",align:"center",multi:true},'
-                'widthConstraint:{maximum:160},scaling:{label:false}},'
-                'edges:{font:{size:9,align:"middle",color:"#444"},'
-                'smooth:{type:"continuous"}},'
-                'interaction:{dragNodes:true,dragView:true,zoomView:true,hover:true}'
-                '});\n</script></body></html>\n'
-            )
-
-    def save_gephi(graph, stem):
-        if graph.number_of_nodes() == 0:
-            return
-        os.makedirs(GEPHI_DIR, exist_ok=True)
-        gexf_path = os.path.join(GEPHI_DIR, f'{stem}.gexf')
-        nx.write_gexf(_sanitize_for_gexf(graph), gexf_path)
-
-    def _edge_loss_index(sub_links):
-        a = np.minimum(sub_links['obj1'].to_numpy(), sub_links['obj2'].to_numpy())
-        b = np.maximum(sub_links['obj1'].to_numpy(), sub_links['obj2'].to_numpy())
-        edge_meta = sub_links.assign(_a=a, _b=b)
-        edge_types = (
-            edge_meta.groupby(['_a', '_b'])['link_type']
-            .agg(lambda s: set(s.unique()))
-            .to_dict()
-        )
-        edge_loss_idx = (
-            edge_meta[edge_meta['Loss_idx'].notna()]
-            .groupby(['_a', '_b'])['Loss_idx']
-            .agg(lambda s: list(pd.unique(s)))
-            .to_dict()
-        )
-        return edge_types, edge_loss_idx
-
-    def style_graph(G, sub_links, people_len):
-        """Цвет + короткие label / полные title; weight всегда ≥ 1."""
-        n_edges = G.number_of_edges()
-        edge_types, edge_loss_idx = _edge_loss_index(sub_links)
-
-        if n_edges > DETAILED_STYLE_MAX_EDGES:
-            red = sub_links[
-                sub_links['link_type'].isin(['Victim_Culprit', 'Culprit_Victim'])
-            ]
-            red_nodes = set(red['obj1']).union(set(red['obj2'])) if len(red) else set()
-            for i in G.nodes:
-                if i in red_nodes:
-                    G.nodes[i]['color'] = 'red'
-                elif i > people_len:
-                    G.nodes[i]['color'] = 'black'
-                else:
-                    G.nodes[i]['color'] = 'grey'
-                full, short = node_labels(i, people_len)
-                G.nodes[i]['title'] = full
-                G.nodes[i]['label'] = short
-            for edge in G.edges:
-                left, right = sorted(edge)
-                losses = loss_text(edge_loss_idx.get((left, right), []))
-                G[left][right].update(
-                    color='black', weight=1.0, width=1,
-                    title=losses, label=losses,
-                )
-            return
-
-        node_types_df = pd.concat([
-            sub_links[['obj1', 'link_type']].rename(columns={'obj1': 'obj'}),
-            sub_links[['obj2', 'link_type']].rename(columns={'obj2': 'obj'}),
-        ], ignore_index=True)
-        node_types = (
-            node_types_df.groupby('obj')['link_type']
-            .agg(lambda s: set(s.unique()))
-            .to_dict()
-        )
-        for i in G.nodes:
-            temp = node_types.get(i, set())
-            if 'Victim_Culprit' in temp or 'Culprit_Victim' in temp:
-                G.nodes[i]['color'] = 'red'
-            elif i > people_len:
-                G.nodes[i]['color'] = 'black'
-            else:
-                G.nodes[i]['color'] = 'grey'
-            full, short = node_labels(i, people_len)
-            G.nodes[i]['title'] = full
-            G.nodes[i]['label'] = short
-        for edge in G.edges:
-            left, right = sorted(edge)
-            key = (left, right)
-            temp = edge_types.get(key, set())
-            losses = loss_text(edge_loss_idx.get(key, []))
-            # Gephi: weight должен быть > 0
-            if 'Culprit_VINv' in temp or 'Victim_VINc' in temp:
-                G[left][right].update(
-                    color='black', weight=1.0, width=1, title=losses, label=losses,
-                )
-            elif 'VINv_VINc' in temp or 'VINc_VINv' in temp:
-                G[left][right].update(
-                    color='black', weight=2.0, width=2, title=losses, label=losses,
-                )
-            elif 'Victim_VINv' in temp or 'Culprit_VINc' in temp:
-                G[left][right].update(
-                    color='black', weight=3.0, width=3, title=losses, label=losses,
-                )
-            elif 'Victim_Culprit' in temp or 'Culprit_Victim' in temp:
-                G[left][right].update(
-                    color='red', weight=4.0, width=4, title=losses, label=losses,
-                )
-            else:
-                G[left][right].update(
-                    color='grey', weight=1.0, width=1, title=losses, label=losses,
-                )
-
-    objects = pd.DataFrame(objects)
-    n_groups = len(big_groups[:_viz_top_n()])
-    people_len = len(people)
-    log(
-        f'срез: hub_degree_n={_hub_degree_n()}, '
-        f'hub_keywords={len(_hub_keywords())} шт.',
-        level='info',
-    )
-
-    for group in range(n_groups):
-        group_nodes = big_groups[group]
-        sub_links = links[
-            links['obj1'].isin(group_nodes) & links['obj2'].isin(group_nodes)
-        ]
-        G = nx.from_pandas_edgelist(sub_links, 'obj1', 'obj2', create_using=nx.Graph())
-        G.remove_edges_from(nx.selfloop_edges(G))
-        n_nodes, n_edges = G.number_of_nodes(), G.number_of_edges()
-        G, cut_info = apply_group_cuts(G, objects)
-        sub_links = sub_links[
-            sub_links['obj1'].isin(G.nodes) & sub_links['obj2'].isin(G.nodes)
-        ]
-        log(
-            f'группа {group + 1}/{n_groups}:  было {n_nodes:,} узлов / {n_edges:,} рёбер → '
-            f'осталось {cut_info["nodes_left"]:,}; seed={cut_info["removed_seeds"]}, '
-            f'всего снято={cut_info["removed_total"]}; компонент={cut_info["components"]}',
-            level='info',
-        )
-        if G.number_of_nodes() == 0:
-            log('группа пуста после среза — пропуск', level='warn')
-            continue
-
-        style_graph(G, sub_links, people_len)
-        save_gephi(G, f'Group_visualisation{group}')
-
-        components = sorted(nx.connected_components(G), key=len, reverse=True)
-        # На диск — только компоненты ≥ bound (иначе после среза хабов будет десятки тысяч файлов)
-        export_comps = [c for c in components if len(c) >= bound]
-        skipped = len(components) - len(export_comps)
-        if skipped:
-            log(
-                f'HTML: пишем {len(export_comps)} комп. (≥{bound}), '
-                f'пропуск мелких: {skipped}',
-                level='info',
-            )
-        if not export_comps:
-            log('нет компонент ≥ bound для HTML', level='warn')
-            continue
-
-        if len(export_comps) > 1:
-            html_dir = os.path.join(HTML_DIR, f'group_{group}')
-            os.makedirs(html_dir, exist_ok=True)
-        else:
-            html_dir = HTML_DIR
-            os.makedirs(html_dir, exist_ok=True)
-
-        for comp_i, comp in enumerate(export_comps):
-            sub = G.subgraph(comp).copy()
-            if len(export_comps) > 1:
-                html_name = f'{group}_{comp_i}.html'
-            else:
-                html_name = f'Group_visualisation{group}.html'
-            save_html(sub, os.path.join(html_dir, html_name))
-        log(f'HTML записано: {len(export_comps)}', level='info')
-
-    log(f'Gephi → {GEPHI_DIR}', level='ok')
-    log(f'HTML  → {HTML_DIR}', level='ok')
+    """Алиас: отрисовка fraud-кандидатов (см. visualize_fraud)."""
+    from .fraud import visualize_fraud
+    return visualize_fraud(group_index=0)
 
 
 # Fraud-пайплайн (удобные реэкспорты для ноутбука)
@@ -1481,4 +825,9 @@ def visualize_fraud(*args, **kwargs):
 
 def hub_audit_report(*args, **kwargs):
     from .fraud import hub_audit_report as _f
+    return _f(*args, **kwargs)
+
+
+def show_quick_slices(*args, **kwargs):
+    from .fraud import show_quick_slices as _f
     return _f(*args, **kwargs)

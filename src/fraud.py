@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import os
-from collections import defaultdict
+from collections import Counter, defaultdict
 
 import networkx as nx
 import numpy as np
@@ -21,15 +21,27 @@ from .main import (
     _clean_entity_label,
     _hub_keywords,
     _node_label,
-    _subgraph_for_group,
 )
 
 
 FRAUD_HTML_DIR = os.path.join(HTML_DIR, 'fraud')
 
+# Кэши между ячейками ноутбука (сбрасываются в clear_fraud_cache / run_pipeline)
+_BUNDLE_CACHE: dict[int, dict] = {}
+_OBJECT_META_CACHE: tuple | None = None  # (key, meta_dict)
+_GROUP_LINKS_CACHE: dict[int, tuple] = {}  # group_index -> (graph, group_links, link_index)
+
 
 def _cfg(name, default):
     return getattr(config, name, default)
+
+
+def clear_fraud_cache() -> None:
+    """Сброс кэшей fraud после перезагрузки vars / смены config."""
+    global _BUNDLE_CACHE, _OBJECT_META_CACHE, _GROUP_LINKS_CACHE
+    _BUNDLE_CACHE = {}
+    _OBJECT_META_CACHE = None
+    _GROUP_LINKS_CACHE = {}
 
 
 def _people_count() -> int:
@@ -47,16 +59,119 @@ def _links_df() -> pd.DataFrame:
     return m.links
 
 
+def _membership_mask(obj1: np.ndarray, obj2: np.ndarray, node_set: set) -> np.ndarray:
+    """Быстрый mask: оба конца ребра ∈ node_set."""
+    if not node_set or len(obj1) == 0:
+        return np.zeros(len(obj1), dtype=bool)
+    mx = int(max(max(node_set), int(obj1.max()), int(obj2.max()))) + 1
+    if mx > 8_000_000:
+        ns = node_set
+        return np.fromiter(
+            (a in ns and b in ns for a, b in zip(obj1, obj2)),
+            dtype=bool,
+            count=len(obj1),
+        )
+    mem = np.zeros(mx, dtype=bool)
+    for n in node_set:
+        if 0 <= n < mx:
+            mem[n] = True
+    return mem[obj1] & mem[obj2]
+
+
+def _build_link_index(sub_links: pd.DataFrame) -> dict:
+    """node -> np.array позиций строк в sub_links."""
+    if sub_links.empty:
+        return {}
+    o1 = sub_links['obj1'].to_numpy()
+    o2 = sub_links['obj2'].to_numpy()
+    buckets: dict[int, list] = defaultdict(list)
+    for i in range(len(o1)):
+        buckets[int(o1[i])].append(i)
+        buckets[int(o2[i])].append(i)
+    return {k: np.asarray(v, dtype=np.int32) for k, v in buckets.items()}
+
+
+def _group_graph_and_links(group_index: int):
+    """Подграф группы + links + индекс инцидентности (с кэшем)."""
+    if group_index in _GROUP_LINKS_CACHE:
+        return _GROUP_LINKS_CACHE[group_index]
+
+    ensure_runtime_state()
+    from . import main as m
+    if group_index < 0 or group_index >= len(m.big_groups):
+        raise IndexError(f'group_index должен быть 0…{len(m.big_groups) - 1}')
+
+    group_nodes = set(m.big_groups[group_index])
+    links = m.links
+    o1 = links['obj1'].to_numpy()
+    o2 = links['obj2'].to_numpy()
+    mask = _membership_mask(o1, o2, group_nodes)
+    group_links = links.loc[mask].reset_index(drop=True)
+    graph = nx.from_pandas_edgelist(
+        group_links, 'obj1', 'obj2', create_using=nx.Graph(),
+    )
+    graph.remove_edges_from(nx.selfloop_edges(graph))
+    link_index = _build_link_index(group_links)
+    _GROUP_LINKS_CACHE[group_index] = (graph, group_links, link_index)
+    return _GROUP_LINKS_CACHE[group_index]
+
+
+def _object_meta(nodes=None) -> dict:
+    """
+    Предрасчёт label / keyword_hit / has_nan / ntype.
+
+    Без nodes — все objects (редко). С nodes — только недостающие индексы (лениво).
+    """
+    global _OBJECT_META_CACHE
+    from . import main as m
+    objects_df = pd.DataFrame(m.objects)
+    people_count = len(m.people)
+    keywords = tuple(_hub_keywords())
+    key = (len(objects_df), people_count, keywords)
+
+    if _OBJECT_META_CACHE is None or _OBJECT_META_CACHE[0] != key:
+        _OBJECT_META_CACHE = (key, {})
+
+    meta = _OBJECT_META_CACHE[1]
+    if nodes is None:
+        todo = [i for i in range(len(objects_df)) if i not in meta]
+    else:
+        todo = [int(n) for n in nodes if int(n) not in meta]
+    if not todo:
+        return meta
+
+    col = objects_df.iloc[:, 0]
+    kw_list = list(keywords)
+    for i in todo:
+        try:
+            raw = col.iloc[i] if i < len(col) else ''
+        except Exception:
+            raw = ''
+        label = _clean_entity_label(raw)
+        kw_hit = label_matches_keywords(label, kw_list) if kw_list else False
+        if kw_hit:
+            ntype = 'юрлицо'
+        elif i >= people_count:
+            ntype = 'VIN'
+        else:
+            ntype = 'человек'
+        meta[i] = {
+            'label': label,
+            'keyword_hit': kw_hit,
+            'has_nan_bd': has_nan_bd(label),
+            'ntype': ntype,
+        }
+    return meta
+
+
 def node_type(obj_idx: int, label: str, people_count: int, keywords) -> str:
+    meta = _object_meta()
+    if obj_idx in meta:
+        return meta[obj_idx]['ntype']
     if label_matches_keywords(label, keywords):
         return 'юрлицо'
     if obj_idx >= people_count:
         return 'VIN'
-    # юрлицо без keyword в списке people (ОПФ могли не попасть)
-    upper = label.upper()
-    if any(x in upper for x in ('ООО', 'АО ', 'ПАО', 'ИП ', '"', '«')):
-        if label_matches_keywords(label, keywords) or '"' in label or '«' in label:
-            return 'юрлицо'
     return 'человек'
 
 
@@ -68,11 +183,13 @@ def has_nan_bd(label: str) -> bool:
 
 
 def classify_hub_basket(obj_idx, label, degree, ntype, keywords,
-                        artifact_n, suspect_n) -> str:
+                        artifact_n, suspect_n, *, keyword_hit=None) -> str:
+    if keyword_hit is None:
+        keyword_hit = label_matches_keywords(label, keywords)
     if has_nan_bd(label) and degree > artifact_n // 2:
         return 'nan_glue'
-    if label_matches_keywords(label, keywords) or ntype == 'юрлицо':
-        if label_matches_keywords(label, keywords):
+    if keyword_hit or ntype == 'юрлицо':
+        if keyword_hit:
             return 'whitelist_legal'
     if ntype in ('человек', 'VIN') and degree > suspect_n:
         return 'suspect_seed'
@@ -88,9 +205,8 @@ def classify_hub_basket(obj_idx, label, degree, ntype, keywords,
 def hub_audit_report(group_index: int = 0, top_n: int = 1000) -> pd.DataFrame:
     """Топ узлов по степени с типом и корзиной."""
     ensure_runtime_state()
-    graph = _subgraph_for_group(group_index)
-    objects_df = _objects_df()
-    people_count = _people_count()
+    graph, _, _ = _group_graph_and_links(group_index)
+    meta = _object_meta(graph.nodes)
     keywords = _hub_keywords()
     artifact_n = int(_cfg('artifact_degree_n', 1000))
     suspect_n = int(_cfg('suspect_degree_n', 20))
@@ -98,17 +214,20 @@ def hub_audit_report(group_index: int = 0, top_n: int = 1000) -> pd.DataFrame:
     deg = dict(graph.degree())
     rows = []
     for node, d in sorted(deg.items(), key=lambda x: -x[1])[:top_n]:
-        label = _node_label(objects_df, node)
-        ntype = node_type(node, label, people_count, keywords)
+        info = meta.get(int(node), {})
+        label = info.get('label') or _node_label(_objects_df(), node)
+        ntype = info.get('ntype') or node_type(node, label, _people_count(), keywords)
+        kw_hit = bool(info.get('keyword_hit', label_matches_keywords(label, keywords)))
         basket = classify_hub_basket(
             node, label, d, ntype, keywords, artifact_n, suspect_n,
+            keyword_hit=kw_hit,
         )
         rows.append({
             'obj_idx': node,
             'degree': int(d),
             'тип': ntype,
-            'has_nan_bd': has_nan_bd(label),
-            'keyword_hit': label_matches_keywords(label, keywords),
+            'has_nan_bd': bool(info.get('has_nan_bd', has_nan_bd(label))),
+            'keyword_hit': kw_hit,
             'корзина': basket,
             'метка': label,
         })
@@ -132,28 +251,22 @@ def show_hub_audit(group_index: int = 0, top_n: int = 40):
 # ---------------------------------------------------------------------------
 
 def strip_leaves_iterative(graph: nx.Graph) -> tuple[nx.Graph, int]:
-    """Итеративно удалить degree==1 (2-core)."""
-    H = graph.copy()
-    removed = 0
-    while H.number_of_nodes():
-        leaves = [n for n, d in H.degree() if d <= 1]
-        if not leaves:
-            break
-        H.remove_nodes_from(leaves)
-        removed += len(leaves)
-    return H, removed
+    """2-core: эквивалент итеративного снятия degree<=1."""
+    before = graph.number_of_nodes()
+    if before == 0:
+        return graph.copy(), 0
+    H = nx.k_core(graph, k=2)
+    return H, before - H.number_of_nodes()
 
 
 def prepare_fraud_graph(group_index: int = 0):
     """
     Граф без whitelist/NaN-склеек + срез листьев.
 
-    Возвращает (graph, meta) где meta содержит множества и счётчики.
+    Возвращает (graph, meta, group_links, link_index).
     """
-    ensure_runtime_state()
-    graph = _subgraph_for_group(group_index)
-    objects_df = _objects_df()
-    people_count = _people_count()
+    graph, group_links, link_index = _group_graph_and_links(group_index)
+    obj_meta = _object_meta(graph.nodes)
     keywords = _hub_keywords()
     artifact_n = int(_cfg('artifact_degree_n', 1000))
     suspect_n = int(_cfg('suspect_degree_n', 20))
@@ -163,12 +276,15 @@ def prepare_fraud_graph(group_index: int = 0):
     suspects = set()
     tags = defaultdict(list)
 
-    for node in list(graph.nodes):
-        label = _node_label(objects_df, node)
+    for node in graph.nodes:
+        info = obj_meta.get(int(node), {})
+        label = info.get('label', '')
         d = deg.get(node, 0)
-        ntype = node_type(node, label, people_count, keywords)
+        ntype = info.get('ntype', 'человек')
+        kw_hit = bool(info.get('keyword_hit', False))
         basket = classify_hub_basket(
             node, label, d, ntype, keywords, artifact_n, suspect_n,
+            keyword_hit=kw_hit,
         )
         if basket in ('whitelist_legal', 'nan_glue', 'artifact'):
             exclude.add(node)
@@ -180,8 +296,19 @@ def prepare_fraud_graph(group_index: int = 0):
     H = graph.copy()
     H.remove_nodes_from([n for n in exclude if n in H])
     H, n_leaves = strip_leaves_iterative(H)
-    # seeds могли стать листьями — оставляем только живые
     suspects = {n for n in suspects if n in H}
+
+    # links только по оставшимся узлам (для скоринга кластеров)
+    keep = set(H.nodes)
+    if keep and not group_links.empty:
+        o1 = group_links['obj1'].to_numpy()
+        o2 = group_links['obj2'].to_numpy()
+        mask = _membership_mask(o1, o2, keep)
+        slim_links = group_links.loc[mask].reset_index(drop=True)
+        slim_index = _build_link_index(slim_links)
+    else:
+        slim_links = group_links.iloc[0:0].copy()
+        slim_index = {}
 
     meta = {
         'excluded': exclude,
@@ -198,7 +325,7 @@ def prepare_fraud_graph(group_index: int = 0):
         f'комп.={meta["components"]}',
         level='info',
     )
-    return H, meta
+    return H, meta, slim_links, slim_index
 
 
 # ---------------------------------------------------------------------------
@@ -233,9 +360,13 @@ def expand_from_seeds(graph: nx.Graph, seeds: set, rounds: int = 2) -> dict:
     return dict(clusters)
 
 
-def build_fraud_clusters(group_index: int = 0):
-    """Кластеры от suspect seeds + мини-CC остатка."""
-    H, meta = prepare_fraud_graph(group_index)
+def build_fraud_clusters(group_index: int = 0, *, force: bool = False):
+    """Кластеры от suspect seeds + мини-CC остатка (кэш по group_index)."""
+    if not force and group_index in _BUNDLE_CACHE:
+        log(f'fraud clusters: кэш group={group_index}', level='info')
+        return _BUNDLE_CACHE[group_index]
+
+    H, meta, slim_links, slim_index = prepare_fraud_graph(group_index)
     max_nodes = int(_cfg('cluster_max_nodes', 500))
     seeds = meta['suspects']
 
@@ -255,7 +386,6 @@ def build_fraud_clusters(group_index: int = 0):
         else:
             needs_split.append(set(comp))
 
-    # мосты: узлы с соседями в разных кластерах
     node_to_cid = {}
     cluster_list = []
     for hub, members in clusters.items():
@@ -291,43 +421,77 @@ def build_fraud_clusters(group_index: int = 0):
         f'needs_split={len(needs_split)}, bridges={len(bridges)}',
         level='info',
     )
-    return {
+    bundle = {
         'graph': H,
         'meta': meta,
         'clusters': cluster_list,
         'bridges': pd.DataFrame(bridges),
         'group_index': group_index,
+        'group_links': slim_links,
+        'link_index': slim_index,
+        'ranked': None,
     }
+    _BUNDLE_CACHE[group_index] = bundle
+    return bundle
 
 
 # ---------------------------------------------------------------------------
 # 4–5. Признаки и типы
 # ---------------------------------------------------------------------------
 
-def _cluster_sublinks(nodes: set) -> pd.DataFrame:
+def _cluster_sublinks(nodes: set, bundle: dict | None = None) -> pd.DataFrame:
+    nodes = set(nodes)
+    if bundle is not None:
+        sub_links = bundle.get('group_links')
+        link_index = bundle.get('link_index') or {}
+        if sub_links is not None and not sub_links.empty and link_index:
+            parts = [link_index[n] for n in nodes if n in link_index]
+            if not parts:
+                return sub_links.iloc[0:0]
+            idxs = np.unique(np.concatenate(parts))
+            cand = sub_links.iloc[idxs]
+            o1 = cand['obj1'].to_numpy()
+            o2 = cand['obj2'].to_numpy()
+            mask = _membership_mask(o1, o2, nodes)
+            return cand.loc[mask]
+        if sub_links is not None:
+            if sub_links.empty:
+                return sub_links
+            o1 = sub_links['obj1'].to_numpy()
+            o2 = sub_links['obj2'].to_numpy()
+            mask = _membership_mask(o1, o2, nodes)
+            return sub_links.loc[mask]
     links = _links_df()
-    return links[links['obj1'].isin(nodes) & links['obj2'].isin(nodes)]
+    o1 = links['obj1'].to_numpy()
+    o2 = links['obj2'].to_numpy()
+    mask = _membership_mask(o1, o2, nodes)
+    return links.loc[mask]
 
 
-def _directed_vc_pairs(nodes: set) -> list[tuple[int, int]]:
+def _directed_vc_pairs(nodes: set, bundle: dict | None = None,
+                       sub_links: pd.DataFrame | None = None) -> list[tuple[int, int]]:
     """Пары (виновник_idx, потерпевший_idx) внутри кластера по Loss_idx."""
     from . import main as m
     data = m.data
-    objects_df = _objects_df()
-    # map label -> idx for people in cluster
+    obj_meta = _object_meta(nodes)
+    people_count = _people_count()
+
     label_to_idx = {}
     for n in nodes:
-        if n < _people_count():
-            label_to_idx[_node_label(objects_df, n)] = n
+        if n < people_count:
+            lab = obj_meta.get(int(n), {}).get('label')
+            if lab:
+                label_to_idx[lab] = n
 
-    sub = _cluster_sublinks(nodes)
-    if sub.empty or 'Loss_idx' not in sub.columns:
+    if sub_links is None:
+        sub_links = _cluster_sublinks(nodes, bundle)
+    if sub_links.empty or 'Loss_idx' not in sub_links.columns:
         return []
-    loss_ids = sub['Loss_idx'].dropna().unique()
-    pairs = []
     if 'Culprit' not in data.columns or 'Victim' not in data.columns:
-        return pairs
-    for lid in loss_ids:
+        return []
+
+    pairs = []
+    for lid in sub_links['Loss_idx'].dropna().unique():
         try:
             row = data.loc[int(lid)]
         except Exception:
@@ -388,25 +552,29 @@ def _ego_density(graph: nx.Graph, hub) -> float:
     return edges / possible
 
 
-def _vin_bitki_features(nodes: set, people_count: int) -> dict:
+def _vin_bitki_features(nodes: set, people_count: int,
+                        bundle: dict | None = None,
+                        sub_links: pd.DataFrame | None = None) -> dict:
     """F4: пересечения исходящих пострадавших VIN."""
     from . import main as m
     data = m.data
-    objects_df = _objects_df()
     vins = {n for n in nodes if n >= people_count}
     if len(vins) < 2 or 'VINc' not in data.columns or 'VINv' not in data.columns:
         return {'bitki_jaccard_max': 0.0, 'vin_role_flip': 0.0, 'vin_star_flag': 0}
 
-    vin_label = {n: _node_label(objects_df, n) for n in vins}
+    obj_meta = _object_meta(vins)
+
+    vin_label = {n: obj_meta.get(int(n), {}).get('label', '') for n in vins}
     label_to_vin = {v: k for k, v in vin_label.items() if v}
 
-    out_victims = defaultdict(set)  # fighter_vin -> set(victim_vins)
+    out_victims = defaultdict(set)
     vin_as_fighter = defaultdict(int)
     vin_as_victim = defaultdict(int)
     vin_drivers = defaultdict(set)
 
-    sub = _cluster_sublinks(nodes)
-    loss_ids = sub['Loss_idx'].dropna().unique() if not sub.empty else []
+    if sub_links is None:
+        sub_links = _cluster_sublinks(nodes, bundle)
+    loss_ids = sub_links['Loss_idx'].dropna().unique() if not sub_links.empty else []
     for lid in loss_ids:
         try:
             row = data.loc[int(lid)]
@@ -435,10 +603,10 @@ def _vin_bitki_features(nodes: set, people_count: int) -> dict:
             union = len(sa | sb) or 1
             j_max = max(j_max, inter / union)
 
-    flip = 0
-    for v in vins:
-        if vin_as_fighter[v] > 0 and vin_as_victim[v] > 0:
-            flip += 1
+    flip = sum(
+        1 for v in vins
+        if vin_as_fighter[v] > 0 and vin_as_victim[v] > 0
+    )
     flip_rate = flip / max(len(vins), 1)
 
     vin_star = 0
@@ -454,7 +622,8 @@ def _vin_bitki_features(nodes: set, people_count: int) -> dict:
     }
 
 
-def score_cluster(graph: nx.Graph, nodes: set, people_count: int) -> dict:
+def score_cluster(graph: nx.Graph, nodes: set, people_count: int,
+                  bundle: dict | None = None) -> dict:
     weights = dict(_cfg('fraud_score_weights', {}))
     sub = graph.subgraph(nodes)
     n = len(nodes)
@@ -463,40 +632,39 @@ def score_cluster(graph: nx.Graph, nodes: set, people_count: int) -> dict:
 
     star_share, hub = _star_share(graph, nodes)
     ego_dens = _ego_density(graph, hub)
-    pairs = _directed_vc_pairs(nodes)
+
+    sub_links = _cluster_sublinks(nodes, bundle)
+    pairs = _directed_vc_pairs(nodes, bundle, sub_links=sub_links)
     cycles = _count_directed_triangles(pairs)
     recip = _reciprocity(pairs)
 
-    # undirected triangles fallback
     undirected_tri = sum(1 for _ in nx.triangles(sub).values()) // 3 if n < 500 else 0
 
-    sub_links = _cluster_sublinks(nodes)
     if not sub_links.empty and 'Loss_idx' in sub_links.columns:
-        a = np.minimum(sub_links['obj1'], sub_links['obj2'])
-        b = np.maximum(sub_links['obj1'], sub_links['obj2'])
-        w = sub_links.assign(_a=a, _b=b).groupby(['_a', '_b'])['Loss_idx'].nunique()
+        a = np.minimum(sub_links['obj1'].to_numpy(), sub_links['obj2'].to_numpy())
+        b = np.maximum(sub_links['obj1'].to_numpy(), sub_links['obj2'].to_numpy())
+        w = (
+            sub_links.assign(_a=a, _b=b)
+            .groupby(['_a', '_b'])['Loss_idx']
+            .nunique()
+        )
         repeat_share = float((w >= 2).mean()) if len(w) else 0.0
     else:
         repeat_share = 0.0
 
-    bitki = _vin_bitki_features(nodes, people_count)
+    bitki = _vin_bitki_features(nodes, people_count, bundle, sub_links=sub_links)
 
-    # role concentration: доля пар где один всегда culprit
     role_conc = 0.0
     if pairs:
-        from collections import Counter
         out_c = Counter(a for a, _ in pairs)
         role_conc = out_c.most_common(1)[0][1] / len(pairs)
 
-    keywords = _hub_keywords()
-    objects_df = _objects_df()
+    obj_meta = _object_meta(nodes)
     wl_share = sum(
-        1 for x in nodes
-        if label_matches_keywords(_node_label(objects_df, x), keywords)
+        1 for x in nodes if obj_meta.get(int(x), {}).get('keyword_hit')
     ) / max(n, 1)
-
     nan_share = sum(
-        1 for x in nodes if has_nan_bd(_node_label(objects_df, x))
+        1 for x in nodes if obj_meta.get(int(x), {}).get('has_nan_bd')
     ) / max(n, 1)
 
     size_fit = 1.0 if 3 <= n <= 50 else (0.5 if n <= 100 else 0.2)
@@ -532,7 +700,6 @@ def score_cluster(graph: nx.Graph, nodes: set, people_count: int) -> dict:
         + weights.get('size_fit', 1) * feats['size_fit']
         + weights.get('whitelist_penalty', -2) * feats['whitelist_share']
     )
-    # undirected bonus if no directed cycles but triangles exist
     if cycles == 0 and undirected_tri > 0:
         score += 1.0 * min(undirected_tri, 5) / 5
 
@@ -548,19 +715,16 @@ def classify_case_type(feats: dict) -> str:
     if feats['bitki_jaccard_max'] >= 0.5 or (
         feats['vin_role_flip'] >= 0.3 and feats['vin_star_flag']
     ):
-        return 'кольцо битков'
+        return 'кольцо битов'
     if feats['directed_cycles'] >= 1 and feats['star_share'] < 0.8:
         return 'группа-колотуны'
     if feats['star_share'] >= 0.8 and feats['ego_density'] < 0.05:
-        objects_df = _objects_df()
         hub = feats.get('hub')
+        obj_meta = _object_meta([hub] if hub is not None else [])
         if hub is not None:
-            lab = _node_label(objects_df, hub)
-            keywords = _hub_keywords()
-            if label_matches_keywords(lab, keywords) or hub >= _people_count():
-                # VIN star already handled; legal hub
-                if hub < _people_count() and label_matches_keywords(lab, keywords):
-                    return 'юрлицо-хаб'
+            info = obj_meta.get(int(hub), {})
+            if info.get('keyword_hit') and hub < _people_count():
+                return 'юрлицо-хаб'
             if hub < _people_count():
                 return 'соло с подставными'
             return 'кольцо битов' if feats['vin_star_flag'] else 'соло с подставными'
@@ -582,6 +746,9 @@ _TYPE_PRIORITY = {
 
 
 def evaluate_fraud_clusters(bundle: dict) -> pd.DataFrame:
+    if bundle.get('ranked') is not None:
+        return bundle['ranked']
+
     graph = bundle['graph']
     people_count = _people_count()
     rows = []
@@ -589,7 +756,7 @@ def evaluate_fraud_clusters(bundle: dict) -> pd.DataFrame:
         nodes = cl['nodes']
         if len(nodes) < 2:
             continue
-        feats = score_cluster(graph, nodes, people_count)
+        feats = score_cluster(graph, nodes, people_count, bundle=bundle)
         ctype = classify_case_type(feats)
         if ctype == 'фоновая мелочь':
             continue
@@ -612,14 +779,17 @@ def evaluate_fraud_clusters(bundle: dict) -> pd.DataFrame:
         })
     df = pd.DataFrame(rows)
     if df.empty:
+        bundle['ranked'] = df
         return df
     df['_prio'] = df['тип'].map(lambda t: _TYPE_PRIORITY.get(t, 5))
     df = df.sort_values(['_prio', 'score'], ascending=[True, False]).drop(columns='_prio')
-    return df.reset_index(drop=True)
+    df = df.reset_index(drop=True)
+    bundle['ranked'] = df
+    return df
 
 
 def quick_fraud_slices(min_pair_losses: int = 2) -> dict[str, pd.DataFrame]:
-    """Быстрые срезы по таблице убытков (до кластеризации)."""
+    """Быстрые срезы по таблице убытков (отдельно от кластеризации)."""
     ensure_runtime_state()
     from . import main as m
     data = m.data
@@ -630,7 +800,6 @@ def quick_fraud_slices(min_pair_losses: int = 2) -> dict[str, pd.DataFrame]:
         pairs = pairs[pairs['убытков'] >= min_pair_losses].sort_values('убытков', ascending=False)
         out['повторные_пары'] = pairs.head(50)
 
-        # взаимность
         s = set(zip(data['Culprit'], data['Victim']))
         mutual = [(a, b) for a, b in s if a != b and (b, a) in s]
         out['взаимные_пары'] = pd.DataFrame(mutual, columns=['a', 'b']).head(50)
@@ -648,8 +817,8 @@ def quick_fraud_slices(min_pair_losses: int = 2) -> dict[str, pd.DataFrame]:
     return out
 
 
-def show_fraud_candidates(group_index: int = 0, top_n: int = 50):
-    """Отчёт: быстрые срезы + топ кластеров по типу/скору."""
+def show_quick_slices():
+    """Показать быстрые срезы по data (опционально, до/после кандидатов)."""
     from IPython.display import display, Markdown
 
     display(Markdown('### Быстрые срезы по убыткам'))
@@ -657,6 +826,16 @@ def show_fraud_candidates(group_index: int = 0, top_n: int = 50):
     for name, df in slices.items():
         display(Markdown(f'**{name}** ({len(df)} строк)'))
         display(df.head(15))
+    return slices
+
+
+def show_fraud_candidates(group_index: int = 0, top_n: int = 50,
+                          *, with_slices: bool = False):
+    """Отчёт: топ кластеров по типу/скору. Срезы — только если with_slices=True."""
+    from IPython.display import display, Markdown
+
+    if with_slices:
+        show_quick_slices()
 
     display(Markdown('### Кластеры-кандидаты (fraud)'))
     bundle = build_fraud_clusters(group_index)
@@ -666,7 +845,6 @@ def show_fraud_candidates(group_index: int = 0, top_n: int = 50):
         'reciprocity', 'repeat_pairs', 'bitki_jaccard', 'vin_star', 'data_quality',
     ]
     display(ranked[show_cols].head(top_n) if len(ranked) else ranked)
-    # keep nodes column in returned frame for viz
     return ranked, bundle
 
 
@@ -682,9 +860,7 @@ def _save_fraud_html(graph: nx.Graph, html_path: str, title: str = ''):
     if parent:
         os.makedirs(parent, exist_ok=True)
 
-    people_count = _people_count()
-    objects_df = _objects_df()
-    keywords = _hub_keywords()
+    obj_meta = _object_meta(graph.nodes)
     cap = int(_cfg('ego_cap_neighbors', 150))
 
     deg = dict(graph.degree())
@@ -694,7 +870,6 @@ def _save_fraud_html(graph: nx.Graph, html_path: str, title: str = ''):
     if hub is not None and graph.number_of_nodes() > cap + 1:
         nbrs = sorted(graph.neighbors(hub), key=lambda n: deg.get(n, 0), reverse=True)
         keep = {hub} | set(nbrs[:cap])
-        # add edges among keep
         tail_count = graph.number_of_nodes() - len(keep)
         nodes_keep = keep
 
@@ -710,9 +885,10 @@ def _save_fraud_html(graph: nx.Graph, html_path: str, title: str = ''):
             'const nodes=new vis.DataSet([\n'
         )
         first = True
-        for i, node in enumerate(sub.nodes):
-            lab = _node_label(objects_df, node)
-            ntype = node_type(node, lab, people_count, keywords)
+        for node in sub.nodes:
+            info = obj_meta.get(int(node), {})
+            lab = info.get('label') or str(node)
+            ntype = info.get('ntype', 'человек')
             shape = {'человек': 'ellipse', 'VIN': 'box', 'юрлицо': 'diamond'}.get(
                 ntype, 'ellipse',
             )
@@ -823,7 +999,6 @@ def visualize_fraud(group_index: int = 0, top_n: int | None = None):
     top_n = top_n or int(_cfg('fraud_viz_top_n', 50))
     log('Fraud viz', level='header')
 
-    # clear fraud html only
     if os.path.isdir(FRAUD_HTML_DIR):
         import shutil
         shutil.rmtree(FRAUD_HTML_DIR)
@@ -847,8 +1022,7 @@ def visualize_fraud(group_index: int = 0, top_n: int | None = None):
         if not nodes:
             nodes = set(id_map.get(row['cluster_id'], ()))
         sub = graph.subgraph(nodes).copy()
-        # mark directed VC edges
-        for a, b in _directed_vc_pairs(nodes):
+        for a, b in _directed_vc_pairs(nodes, bundle):
             if sub.has_edge(a, b):
                 sub[a][b]['directed'] = True
                 sub[a][b]['color'] = '#c0392b'

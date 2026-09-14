@@ -32,20 +32,14 @@ wrong_auto_val = {
 # и в отрисовку. Группы меньше bound объектов отбрасываются как шум.
 bound = 15
 
-# Сколько крупнейших исходных big_groups смотреть в fraud-пайплайне / legacy viz.
-viz_top_n = 200
-
-# Режим визуализации: "fraud" — кандидаты-кольца; "legacy" — старый срез хабов.
-cluster_mode = 'fraud'
-
-# Порог степени для suspect-seed (физлица/VIN) и legacy-среза.
-# Подбор: hub_audit_report / show_degree_report.
-hub_degree_n = 100
+# Сколько крупнейших исходных big_groups учитывать в отчётах.
+viz_top_n = 5
 
 # Узлы со степенью > artifact_degree_n (кроме keyword) — кандидаты в склейки/артефакты.
 artifact_degree_n = 1000
 
 # Seed подозрительных физ/VIN: degree > suspect_degree_n.
+# Подбор: show_hub_audit / hub_audit_report.
 suspect_degree_n = 20
 
 # Макс. размер кластера для HTML; больше → needs_split (фаза 2 / колпак).
