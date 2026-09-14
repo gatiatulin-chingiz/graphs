@@ -1,8 +1,14 @@
 # Changelog
 
+## 2026-09-14
+
+- Fraud-пайплайн (`src/fraud.py`): аудит хабов → whitelist/NaN exclude → кластеры от suspect seeds → скоринг/типы (колотуны, битки, соло, юрлицо-хаб) → HTML в `./output/html/fraud/`.
+- `hub_keywords`: матч **целого слова/фразы** (регистр не важен); каталог ОПФ/ИП + бренды; `cluster_mode='fraud'`.
+- Runner: `show_hub_audit` → `show_fraud_candidates` → `visualize_fraud`.
+
 ## 2026-09-11
 
-- Срез хабов: `hub_keywords` (подстрока, без регистра) среди топ-хабов `degree > hub_degree_n`; удаляется хаб **и все соседи** (не весь граф — иначе снесёт компоненту 0).
+- Срез хабов: `hub_keywords` среди топ-хабов; удаляется хаб и соседи (legacy при `cluster_mode='legacy'`).
 - Отчёт: топ-хабов только **после** среза; `legal_forms_remove` заменён на `hub_keywords`.
 - Пайплайн: `run_pipeline()` по умолчанию **без** отрисовки → сначала `show_degree_report()`, затем `visualize()`.
 - HTML на диск только для компонент размером ≥ `bound`.

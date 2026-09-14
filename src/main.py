@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import pickle
 import shutil
@@ -16,6 +17,8 @@ wrong_people_val = config.wrong_people_val
 wrong_auto_val = config.wrong_auto_val
 bound = config.bound
 
+_WORD_CHAR = r'0-9A-Za-zА-Яа-яЁё'
+
 
 def _viz_top_n() -> int:
     """Сколько крупнейших групп рисовать (из config, при каждом вызове)."""
@@ -27,13 +30,29 @@ def _hub_degree_n() -> int:
     return max(0, int(getattr(config, 'hub_degree_n', 0)))
 
 
+def _normalize_keyword(kw: str) -> str:
+    """Strip кавычек/дефисов с краёв, схлопнуть пробелы, casefold."""
+    text = str(kw).strip()
+    text = text.strip('\'"`«»')
+    text = text.strip('-–—')
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text.casefold()
+
+
 def _hub_keywords():
-    """Ключевые слова среза (case-insensitive). Пустой = только degree-срез."""
+    """Ключевые слова whitelist (нормализованные, без пустых/дублей)."""
     raw = getattr(config, 'hub_keywords', None)
     if raw is None:
-        # старое имя списка
         raw = getattr(config, 'legal_forms_remove', None) or []
-    return [str(x).strip() for x in raw if str(x).strip()]
+    seen = set()
+    out = []
+    for item in raw:
+        norm = _normalize_keyword(item)
+        if not norm or norm in seen:
+            continue
+        seen.add(norm)
+        out.append(norm)
+    return out
 
 
 def _clean_entity_label(label) -> str:
@@ -47,13 +66,28 @@ def _clean_entity_label(label) -> str:
 
 
 def label_matches_keywords(label, keywords) -> bool:
-    """Регистронезависимое вхождение любой подстроки из keywords в метку."""
+    """
+    Регистронезависимое совпадение целого слова/фразы из keywords.
+
+    'ооо' → ООО "Ромашка" да; ПОООРФЕНОВ — нет.
+    """
     if not keywords:
         return False
     text = _clean_entity_label(label).casefold()
     if not text:
         return False
-    return any(str(kw).strip().casefold() in text for kw in keywords if str(kw).strip())
+    for kw in keywords:
+        phrase = _normalize_keyword(kw)
+        if not phrase:
+            continue
+        pattern = (
+            rf'(?<![{_WORD_CHAR}])'
+            + re.escape(phrase)
+            + rf'(?![{_WORD_CHAR}])'
+        )
+        if re.search(pattern, text):
+            return True
+    return False
 
 
 def _node_label(objects_df: pd.DataFrame, node) -> str:
@@ -260,10 +294,17 @@ def run_pipeline(*, draw: bool = False):
         visualize()
         log('Готово', level='ok')
     else:
-        log(
-            'дальше: show_degree_report() → подберите N/keywords → visualize()',
-            level='ok',
-        )
+        mode = str(getattr(config, 'cluster_mode', 'fraud'))
+        if mode == 'fraud':
+            log(
+                'дальше: show_hub_audit() → show_fraud_candidates() → visualize_fraud()',
+                level='ok',
+            )
+        else:
+            log(
+                'дальше: show_degree_report() → visualize() [legacy]',
+                level='ok',
+            )
 
 
 # Для скриптов; в ноутбуке используйте run_pipeline()
@@ -1044,11 +1085,16 @@ def apply_group_cuts(graph: nx.Graph, objects_df: pd.DataFrame):
 def visualize():
     global links, data, big_groups, objects, people, VIN, ID_col
 
+    mode = str(getattr(config, 'cluster_mode', 'fraud'))
+    if mode == 'fraud':
+        from .fraud import visualize_fraud
+        return visualize_fraud(group_index=0)
+
     ensure_runtime_state()
     ensure_artifact_dirs()
     clear_graph_outputs()
     ensure_artifact_dirs()
-    log('Отрисовка Gephi/HTML', level='header')
+    log('Отрисовка Gephi/HTML (legacy)', level='header')
     log_cut_preview(group_index=0)
 
     def loss_text(loss_ids, limit=3):
@@ -1415,3 +1461,24 @@ def visualize():
 
     log(f'Gephi → {GEPHI_DIR}', level='ok')
     log(f'HTML  → {HTML_DIR}', level='ok')
+
+
+# Fraud-пайплайн (удобные реэкспорты для ноутбука)
+def show_hub_audit(*args, **kwargs):
+    from .fraud import show_hub_audit as _f
+    return _f(*args, **kwargs)
+
+
+def show_fraud_candidates(*args, **kwargs):
+    from .fraud import show_fraud_candidates as _f
+    return _f(*args, **kwargs)
+
+
+def visualize_fraud(*args, **kwargs):
+    from .fraud import visualize_fraud as _f
+    return _f(*args, **kwargs)
+
+
+def hub_audit_report(*args, **kwargs):
+    from .fraud import hub_audit_report as _f
+    return _f(*args, **kwargs)
