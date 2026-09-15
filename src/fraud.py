@@ -745,6 +745,35 @@ _TYPE_PRIORITY = {
 }
 
 
+def _resolve_top_n_per_type(top_n_per_type=None):
+    """int или dict[тип→N]; None → config.fraud_top_n_per_type."""
+    if top_n_per_type is None:
+        top_n_per_type = _cfg('fraud_top_n_per_type', 15)
+    return top_n_per_type
+
+
+def select_fraud_top(ranked: pd.DataFrame, top_n_per_type=None) -> pd.DataFrame:
+    """
+    Для каждого типа: Top-N по score↓.
+    Порядок блоков — по _TYPE_PRIORITY.
+    """
+    if ranked is None or ranked.empty:
+        return ranked if ranked is not None else pd.DataFrame()
+    ncfg = _resolve_top_n_per_type(top_n_per_type)
+    types_ordered = sorted(
+        ranked['тип'].dropna().unique(),
+        key=lambda t: _TYPE_PRIORITY.get(t, 5),
+    )
+    parts = []
+    for t in types_ordered:
+        sub = ranked[ranked['тип'] == t].sort_values('score', ascending=False)
+        n = int(ncfg[t]) if isinstance(ncfg, dict) else int(ncfg)
+        parts.append(sub.head(max(0, n)))
+    if not parts:
+        return ranked.iloc[0:0].copy()
+    return pd.concat(parts, ignore_index=True)
+
+
 def evaluate_fraud_clusters(bundle: dict) -> pd.DataFrame:
     if bundle.get('ranked') is not None:
         return bundle['ranked']
@@ -829,23 +858,27 @@ def show_quick_slices():
     return slices
 
 
-def show_fraud_candidates(group_index: int = 0, top_n: int = 50,
+def show_fraud_candidates(group_index: int = 0, top_n_per_type=None,
                           *, with_slices: bool = False):
-    """Отчёт: топ кластеров по типу/скору. Срезы — только если with_slices=True."""
+    """Отчёт: Top-N по score внутри каждого типа. Срезы — with_slices=True."""
     from IPython.display import display, Markdown
 
     if with_slices:
         show_quick_slices()
 
-    display(Markdown('### Кластеры-кандидаты (fraud)'))
+    display(Markdown('### Кластеры-кандидаты (fraud): Top-N по score внутри типа'))
     bundle = build_fraud_clusters(group_index)
     ranked = evaluate_fraud_clusters(bundle)
+    view = select_fraud_top(ranked, top_n_per_type)
+    ncfg = _resolve_top_n_per_type(top_n_per_type)
+    display(Markdown(f'`fraud_top_n_per_type` = `{ncfg}` · всего в витрине: **{len(view)}**'))
     show_cols = [
         'cluster_id', 'тип', 'score', 'size', 'star_share', 'directed_cycles',
         'reciprocity', 'repeat_pairs', 'bitki_jaccard', 'vin_star', 'data_quality',
     ]
-    display(ranked[show_cols].head(top_n) if len(ranked) else ranked)
-    return ranked, bundle
+    display(view[show_cols] if len(view) else view)
+    bundle['view'] = view
+    return view, bundle
 
 
 # ---------------------------------------------------------------------------
@@ -948,9 +981,8 @@ def _save_fraud_html(graph: nx.Graph, html_path: str, title: str = ''):
         )
 
 
-def _build_overview_html(ranked: pd.DataFrame, path: str):
+def _build_overview_html(view: pd.DataFrame, path: str):
     os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
-    top = ranked.head(int(_cfg('fraud_viz_top_n', 50)))
     with open(path, 'w', encoding='utf-8') as fh:
         fh.write(
             '<!DOCTYPE html><html><head><meta charset="utf-8"><title>Fraud overview</title>'
@@ -966,7 +998,7 @@ def _build_overview_html(ranked: pd.DataFrame, path: str):
             'соло с подставными': '#f1c40f',
             'юрлицо-хаб': '#9b59b6',
         }
-        for _, row in top.iterrows():
+        for _, row in view.iterrows():
             size = 10 + min(int(row['size']), 200) / 5
             item = {
                 'id': str(row['cluster_id']),
@@ -993,10 +1025,9 @@ def _build_overview_html(ranked: pd.DataFrame, path: str):
         )
 
 
-def visualize_fraud(group_index: int = 0, top_n: int | None = None):
-    """Обзор + эго топ-кластеров в ./output/html/fraud/."""
+def visualize_fraud(group_index: int = 0, top_n_per_type=None):
+    """Обзор + эго: Top-N по score внутри каждого типа → ./output/html/fraud/."""
     ensure_artifact_dirs()
-    top_n = top_n or int(_cfg('fraud_viz_top_n', 50))
     log('Fraud viz', level='header')
 
     if os.path.isdir(FRAUD_HTML_DIR):
@@ -1006,18 +1037,23 @@ def visualize_fraud(group_index: int = 0, top_n: int | None = None):
 
     bundle = build_fraud_clusters(group_index)
     ranked = evaluate_fraud_clusters(bundle)
-    if ranked.empty:
+    view = select_fraud_top(ranked, top_n_per_type)
+    bundle['view'] = view
+    if view.empty:
         log('нет кандидатов для отрисовки', level='warn')
-        return ranked
+        return view
+
+    ncfg = _resolve_top_n_per_type(top_n_per_type)
+    log(f'витрина: fraud_top_n_per_type={ncfg}, строк={len(view)}', level='info')
 
     overview = os.path.join(FRAUD_HTML_DIR, 'overview.html')
-    _build_overview_html(ranked, overview)
+    _build_overview_html(view, overview)
     log(f'обзор → {overview}', level='ok')
 
     graph = bundle['graph']
     id_map = {cl['cluster_id']: cl['nodes'] for cl in bundle['clusters']}
 
-    for _, row in ranked.head(top_n).iterrows():
+    for _, row in view.iterrows():
         nodes = set(row['nodes']) if row['nodes'] is not None else set()
         if not nodes:
             nodes = set(id_map.get(row['cluster_id'], ()))
@@ -1032,13 +1068,13 @@ def visualize_fraud(group_index: int = 0, top_n: int | None = None):
         safe_id = str(row['cluster_id']).replace('/', '_')
         path = os.path.join(FRAUD_HTML_DIR, f'{safe_id}.html')
         _save_fraud_html(sub, path, title=f"{row['тип']} {row['score']}")
-    log(f'эго записано: {min(top_n, len(ranked))} → {FRAUD_HTML_DIR}', level='ok')
-    return ranked
+    log(f'эго записано: {len(view)} → {FRAUD_HTML_DIR}', level='ok')
+    return view
 
 
-def run_fraud_pipeline(group_index: int = 0, top_n: int = 50):
+def run_fraud_pipeline(group_index: int = 0, top_n_per_type=None):
     """Аудит → кандидаты → viz (удобный one-shot после run_pipeline)."""
     show_hub_audit(group_index, top_n=40)
-    ranked, bundle = show_fraud_candidates(group_index, top_n=top_n)
-    visualize_fraud(group_index, top_n=top_n)
-    return ranked, bundle
+    view, bundle = show_fraud_candidates(group_index, top_n_per_type=top_n_per_type)
+    visualize_fraud(group_index, top_n_per_type=top_n_per_type)
+    return view, bundle

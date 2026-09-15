@@ -28,30 +28,28 @@ wrong_auto_val = {
 # Основные рычаги (их смотрит бизнес)
 # ---------------------------------------------------------------------------
 
-# Минимальный размер группы (число объектов), чтобы она попала в отчёт
-# и в отрисовку. Группы меньше bound объектов отбрасываются как шум.
+# Компонента C участвует в mini/needs_split только если |C| ≥ bound.
+# big_groups = {C : |C| > bound} для statistics.xlsx.
 bound = 15
 
-# Сколько крупнейших исходных big_groups учитывать в отчётах.
-viz_top_n = 5
-
-# Узлы со степенью > artifact_degree_n (кроме keyword) — кандидаты в склейки/артефакты.
+# v → artifact/nan_glue, если deg(v) > artifact_degree_n (и не whitelist).
 artifact_degree_n = 1000
 
-# Seed подозрительных физ/VIN: degree > suspect_degree_n.
-# Подбор: show_hub_audit / hub_audit_report.
+# Seeds = {v : тип ∈ {человек,VIN}, deg(v) > suspect_degree_n}, после exclude.
 suspect_degree_n = 20
 
-# Макс. размер кластера для HTML; больше → needs_split (фаза 2 / колпак).
+# Компонента остатка: bound ≤ |C| ≤ cluster_max_nodes → mini;
+# |C| > cluster_max_nodes → needs_split.
 cluster_max_nodes = 500
 
-# Сколько соседей хаба рисовать на эго (остальное — узел «хвост»).
+# На эго-HTML: рисуем ≤ ego_cap_neighbors соседей хаба; остальное — узел «хвост».
 ego_cap_neighbors = 150
 
-# Сколько топ-кластеров по типу/скору рисовать.
-fraud_viz_top_n = 50
+# Витрина и HTML: для каждого типа — Top-N по score↓.
+# int → одинаковый N для всех типов; dict → квоты по имени типа.
+fraud_top_n_per_type = 15
 
-# Веса признаков скора внутри типа (сумма не обязана = 1).
+# Веса слагаемых score(C); сумма не обязана = 1.
 fraud_score_weights = {
     'repeat_pairs': 2.0,
     'reciprocity': 2.5,
@@ -64,9 +62,8 @@ fraud_score_weights = {
     'whitelist_penalty': -2.0,
 }
 
-# Whitelist юрлиц/ОПФ/брендов для исключения из кластеризации (не seed колец).
-# Матч: регистронезависимо, только целое слово/фраза
-# (ООО "Ромашка" — да, ПОООРФЕНОВ — нет).
+# Whitelist: keyword-hit → exclude из кластеризации.
+# Матч: casefold, целое слово/фраза (ООО "Ромашка" — да, ПОООРФЕНОВ — нет).
 hub_keywords = [
     # --- бренды / отрасли ---
     'ресо',

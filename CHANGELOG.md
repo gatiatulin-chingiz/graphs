@@ -1,5 +1,10 @@
 # Changelog
 
+## 2026-09-15
+
+- Витрина/HTML: Top-N по `score` **внутри каждого типа** (`fraud_top_n_per_type`); убраны дубли `viz_top_n` / `fraud_viz_top_n`.
+- Runner: `view, bundle = show_fraud_candidates()` → `visualize_fraud()`; полный список в `bundle['ranked']`.
+
 ## 2026-09-14
 
 - Fraud-пайплайн (`src/fraud.py`): аудит хабов → whitelist/NaN exclude → кластеры от suspect seeds → скоринг/типы (колотуны, битки, соло, юрлицо-хаб) → HTML в `./output/html/fraud/`.

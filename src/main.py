@@ -23,11 +23,6 @@ _WORD_CHAR = r'0-9A-Za-zА-Яа-яЁё'
 _KEYWORD_PATTERN_CACHE: dict[tuple, list] = {}
 
 
-def _viz_top_n() -> int:
-    """Сколько крупнейших групп рисовать (из config, при каждом вызове)."""
-    return max(1, int(getattr(config, 'viz_top_n', 200)))
-
-
 def _normalize_keyword(kw: str) -> str:
     """Strip кавычек/дефисов с краёв, схлопнуть пробелы, casefold."""
     text = str(kw).strip()
@@ -228,8 +223,11 @@ def run_pipeline(*, draw: bool = False):
     """
     keywords = _hub_keywords()
     log('Пайплайн графов', level='header')
-    log(f'viz_top_n = {_viz_top_n()}', level='info')
     log(f'suspect_degree_n = {int(getattr(config, "suspect_degree_n", 20))}', level='info')
+    log(
+        f'fraud_top_n_per_type = {getattr(config, "fraud_top_n_per_type", 15)}',
+        level='info',
+    )
     log(
         f'hub_keywords (whitelist) = {len(keywords)} шт.'
         + (
