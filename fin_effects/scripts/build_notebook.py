@@ -147,14 +147,15 @@ losses = load_losses_from_db()   # SQL из fin_effects/queries.py
 cards = load_cards_from_db()
 ```
 
-Выгрузки сервиса (xlsx с участниками групп) читаются функцией
-`load_beneficiaries` / `run_pipeline_from_files`.
+Выгрузки сервиса — Excel в `data/raw/<YYYY>/` (годы подхватываются сами:
+`2023`, `2024`, `2025`, …). Убытки и карточки УПС в продовом режиме
+читаются SQL-запросами (`load_losses_from_db` / `load_cards_from_db`),
+класть `losses.pkl` вручную не нужно.
 
-Здесь, чтобы ноутбук был воспроизводим без доступа к БД, работает
-синтетический генератор: он создаёт выгрузки в том же формате, что и продовые."""
+Для воспроизводимости без БД по умолчанию включён синтетический генератор."""
     )
     code(
-        """SYNTHETIC = True   # False -> читать продовые выгрузки из data/raw
+        """SYNTHETIC = True   # False -> Excel из data/raw/<YYYY>/ + losses/cards из OISUU
 
 if SYNTHETIC:
     config = SynthConfig(
@@ -179,13 +180,15 @@ if SYNTHETIC:
     BENEFICIARY_FILES = data.beneficiary_files
 else:
     from fin_effects.excel_beneficiaries import load_beneficiaries_from_dir
-    from fin_effects.loaders import load_table
+    from fin_effects.loaders import load_cards_from_db, load_losses_from_db
 
+    # years не задаём: берутся все каталоги data/raw/YYYY, какие есть
     BENEFICIARIES, _stats = load_beneficiaries_from_dir(
-        PROJECT_ROOT / "data" / "raw", years=[LAST_YEAR], workers=4
+        PROJECT_ROOT / "data" / "raw", workers=4
     )
-    LOSSES = load_table(PROJECT_ROOT / "data" / "raw" / "losses.pkl")
-    CARDS = load_table(PROJECT_ROOT / "data" / "raw" / "cards.pkl")
+    print(_stats.as_text())
+    LOSSES = load_losses_from_db()
+    CARDS = load_cards_from_db()
     TRUTH = None
     BENEFICIARY_FILES = []
 

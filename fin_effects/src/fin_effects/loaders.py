@@ -1,8 +1,8 @@
 """Загрузка таблиц ``losses`` / ``cards`` — из БД OISUU или из файлов.
 
-Ноутбук не должен уметь ходить в продовую БД: расчёты берут данные из
-``data/interim`` (артефакты) или из ``data/raw`` (выгрузки). Работа с БД живёт в
-``loaders.py`` и вызывается отдельным явным шагом обновления данных.
+В продовом контуре убытки и карточки УПС читаются SQL-запросами
+(:func:`load_losses_from_db`, :func:`load_cards_from_db`). Файловый путь
+(:func:`load_table`) нужен для кэша/синтетики, а не как обязательный ручной шаг.
 """
 
 from __future__ import annotations
@@ -72,7 +72,12 @@ def read_sql(
     LOGGER.info("Чтение из OISUU: %s (database=%s)", config.server, database or config.database)
 
     with pyodbc.connect(connection_string) as connection:
-        return pd.read_sql_query(query, connection, chunksize=chunksize)
+        if chunksize is None:
+            return pd.read_sql_query(query, connection)
+        chunks = list(pd.read_sql_query(query, connection, chunksize=chunksize))
+        if not chunks:
+            return pd.DataFrame()
+        return pd.concat(chunks, ignore_index=True)
 
 
 def load_losses_from_db(db_config: DbConfig | None = None) -> pd.DataFrame:

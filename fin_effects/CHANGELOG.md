@@ -2,6 +2,10 @@
 
 ## 2026-10-05
 
+- Что: продовая загрузка в ноутбуке универсальна — Excel из всех `data/raw/<YYYY>/`, `losses`/`cards` из SQL (`load_losses_from_db` / `load_cards_from_db`); `discover_workbooks` сам находит годовые каталоги; `read_sql` склеивает чанки в DataFrame.
+- Зачем: не требовать ручной `losses.pkl` и не жёстко привязываться к одному году вроде 2026.
+- Проверка: `SYNTHETIC = False`, положить xlsx в `data/raw/2024` (и/или другие годы), задать `OISUU_UID`/`OISUU_PWD`, выполнить ячейку источника данных.
+
 - Что: добавлен HTML-отчёт по финансовому эффекту (`write_html_report`, скрипт `scripts/build_html_report.py`).
 - Зачем: быстрый самодостаточный отчёт после прогона на синтетике (таблицы + встроенные графики).
 - Проверка: `python scripts/build_html_report.py` → `outputs/reports/financial_effect.html`.

@@ -66,12 +66,33 @@ class BeneficiaryLoadStats:
         )
 
 
+def discover_year_dirs(root: str | Path) -> list[Path]:
+    """Находит подкаталоги-годы ``YYYY`` в корне выгрузки.
+
+    Args:
+        root: корневой каталог (обычно ``data/raw``).
+
+    Returns:
+        Отсортированный список существующих каталогов вида ``2023``, ``2024``, …
+    """
+    root_path = Path(root)
+    if not root_path.exists():
+        return []
+    years = [
+        path
+        for path in root_path.iterdir()
+        if path.is_dir() and path.name.isdigit() and len(path.name) == 4
+    ]
+    return sorted(years, key=lambda path: path.name)
+
+
 def discover_workbooks(root: str | Path, years: Iterable[str | int] = ()) -> list[Path]:
     """Ищет xlsx/xls-файлы выгрузки сервиса.
 
     Args:
         root: корневой каталог выгрузки.
-        years: подкаталоги-годы; если пусто — поиск по всему ``root``.
+        years: подкаталоги-годы; если пусто — все каталоги ``YYYY`` в ``root``
+            (например ``data/raw/2023``, ``data/raw/2024`` …).
 
     Returns:
         Отсортированный список путей к файлам.
@@ -85,7 +106,18 @@ def discover_workbooks(root: str | Path, years: Iterable[str | int] = ()) -> lis
         LOGGER.warning("Каталог выгрузок не найден: %s", root_path)
         return []
 
-    year_dirs = [root_path / str(year) for year in years] or [root_path]
+    requested = [str(year) for year in years]
+    if requested:
+        year_dirs = [root_path / year for year in requested]
+    else:
+        year_dirs = discover_year_dirs(root_path)
+        if not year_dirs:
+            LOGGER.warning(
+                "В %s нет подкаталогов-лет (YYYY); Excel-файлы не найдены",
+                root_path,
+            )
+            return []
+
     found: list[Path] = []
     for directory in year_dirs:
         if not directory.exists():
@@ -97,7 +129,11 @@ def discover_workbooks(root: str | Path, years: Iterable[str | int] = ()) -> lis
     unique = sorted(
         {path for path in found if not path.name.startswith("~$") and path.is_file()}
     )
-    LOGGER.info("Найдено файлов выгрузки: %d", len(unique))
+    LOGGER.info(
+        "Найдено файлов выгрузки: %d (годы: %s)",
+        len(unique),
+        ", ".join(path.name for path in year_dirs if path.exists()) or "—",
+    )
     return unique
 
 
