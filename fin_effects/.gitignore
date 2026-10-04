@@ -1,0 +1,27 @@
+# Virtual env
+.venv/
+venv/
+env/
+
+# Pip temporary build isolation leftovers (from interrupted pip install -e)
+pip-build-*/
+pip-ephem-wheel-cache-*/
+pip-install-*/
+pip-wheel-metadata/
+pip-modern-metadata/
+
+# Python / tools
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Local outputs / caches (keep structure via code, not tracked dumps)
+data/interim/
+data/benchmark/
+*.pkl
+.ipynb_checkpoints/

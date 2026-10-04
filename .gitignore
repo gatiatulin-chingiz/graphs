@@ -1,0 +1,68 @@
+# Credentials / secrets
+.env
+.env.*
+!.env.example
+!**/.env.example
+!**/env.example
+*.pem
+*.key
+*credentials*
+*secrets*
+secrets/
+credentials/
+
+# Data
+**/data/
+*.csv
+*.tsv
+*.xlsx
+*.xls
+*.parquet
+*.feather
+*.pkl
+*.pickle
+*.h5
+*.hdf5
+*.sqlite
+*.db
+
+# Reports / outputs
+**/outputs/
+**/output/
+**/reports/
+**/figures/
+**/vars/
+*.html
+*.pdf
+*.gexf
+
+# Python / tooling
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+.eggs/
+.ipynb_checkpoints/
+pip-build-*/
+pip-ephem-wheel-cache-*/
+pip-install-*/
+pip-wheel-metadata/
+pip-modern-metadata/
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Archives and local leftovers
+*.zip
+tmp*
+_git_history_backup/

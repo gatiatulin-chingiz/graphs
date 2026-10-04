@@ -1,0 +1,14 @@
+pandas>=2.0
+numpy>=1.24
+openpyxl>=3.1
+matplotlib>=3.7
+pyarrow>=14.0
+
+# Опционально: доступ к OISUU MS SQL (в ноутбуке не нужен)
+# pyodbc>=5.0
+
+# Опционально: запуск/пересборка ноутбука
+# jupyterlab>=4.0
+# nbformat>=5.9
+# nbclient>=0.10
+# ipykernel>=6.29
