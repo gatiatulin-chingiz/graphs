@@ -1,0 +1,31 @@
+# Скопируй в .env рядом с этим файлом и заполни.
+#   cp env_template .env
+# На Jupyter: restart kernel после изменения .env.
+
+# --- OISUU (SQL Server) ---
+OISUU_SERVER=oisuu-db-biz.vsk.ru
+OISUU_DATABASE=OISUU_report
+OISUU_UID=
+OISUU_PWD=
+
+# Драйвер ODBC. На VSK Jupyter часто НЕТ "ODBC Driver 17",
+# зато есть Driver 18 и/или libmsodbcsql-18.so.
+# Если пусто — код сам ищет .so на диске и pyodbc.drivers().
+#
+# Проверка в тетрадке:
+#   import pyodbc, glob
+#   print(pyodbc.drivers())
+#   print(glob.glob('/usr/lib64/libmsodbcsql*'))
+#   print(glob.glob('/opt/microsoft/**/libmsodbcsql*', recursive=True))
+#
+# Рабочие варианты с того же хоста:
+# OISUU_ODBC_DRIVER=ODBC Driver 18 for SQL Server
+# OISUU_ODBC_DRIVER=/usr/lib64/libmsodbcsql-18.so
+# OISUU_ODBC_DRIVER=/opt/microsoft/msodbcsql18/lib64/libmsodbcsql-18.5.so.1.1
+OISUU_ODBC_DRIVER=/usr/lib64/libmsodbcsql-18.so
+
+# Алиасы из других проектов (подхватятся, если UID/PWD пустые):
+# OISUU_CONN_HOST=
+# OISUU_CONN_USERNAME=
+# OISUU_CONN_PASSWORD=
+# OISUU_CONN_DATABASE=

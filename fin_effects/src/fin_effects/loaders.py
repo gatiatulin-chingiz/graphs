@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import glob
 import logging
 from collections.abc import Iterable
 from pathlib import Path
@@ -15,7 +16,7 @@ from typing import Any
 import pandas as pd
 
 from . import queries
-from .config import DbConfig
+from .config import DbConfig, load_dotenv
 from .io_utils import read_pickle, write_pickle
 
 LOGGER = logging.getLogger(__name__)
@@ -27,6 +28,14 @@ LOSS_KEY = "LossNumber"
 CARD_LOSS_KEY = "Номер Убытка"
 
 READABLE_SUFFIXES = (".pkl", ".pickle", ".parquet", ".csv", ".xlsx", ".xls")
+
+#: Типичные пути к libmsodbcsql на Jupyter / RHEL (как в monitoring).
+_SO_GLOBS = (
+    "/usr/lib64/libmsodbcsql*.so",
+    "/usr/lib/libmsodbcsql*.so",
+    "/opt/microsoft/msodbcsql*/lib64/libmsodbcsql*.so",
+    "/opt/microsoft/msodbcsql*/lib64/libmsodbcsql-*.so*",
+)
 
 
 def _require_pyodbc() -> Any:
@@ -42,10 +51,109 @@ def _require_pyodbc() -> Any:
         import pyodbc  # noqa: PLC0415 - опциональная зависимость
     except ImportError as error:  # pragma: no cover - зависит от окружения
         raise ImportError(
-            "Для чтения из OISUU установите pyodbc и ODBC Driver 17 for SQL Server "
-            "(pip install pyodbc)"
+            "Для чтения из OISUU установите pyodbc "
+            "(pip install pyodbc) и ODBC-драйвер SQL Server / libmsodbcsql"
         ) from error
     return pyodbc
+
+
+def list_available_odbc_drivers() -> list[str]:
+    """Возвращает драйверы из ``pyodbc.drivers()``."""
+    try:
+        pyodbc = _require_pyodbc()
+        return list(pyodbc.drivers())
+    except Exception:  # pragma: no cover - зависит от окружения
+        return []
+
+
+def find_msodbcsql_libraries() -> list[str]:
+    """Ищет реальные ``libmsodbcsql*.so`` на диске (обход битого odbcinst)."""
+    found: list[str] = []
+    for pattern in _SO_GLOBS:
+        for path in sorted(glob.glob(pattern)):
+            if path not in found and Path(path).is_file():
+                found.append(path)
+    return found
+
+
+def candidate_odbc_drivers(explicit: str | None = None) -> list[str]:
+    """Собирает список кандидатов: явный → `.so` на диске → SQL Server из pyodbc."""
+    drivers: list[str] = []
+
+    def _add(name: str | None) -> None:
+        if name and name not in drivers:
+            drivers.append(name)
+
+    _add((explicit or "").strip() or None)
+    for so_path in find_msodbcsql_libraries():
+        _add(so_path)
+    for registered in list_available_odbc_drivers():
+        low = registered.lower()
+        if any(token in low for token in ("sql server", "msodbcsql", "freetds", "tds")):
+            _add(registered)
+    return drivers
+
+
+def connect_oisuu(
+    db_config: DbConfig | None = None,
+    *,
+    database: str | None = None,
+) -> Any:
+    """Открывает соединение с OISUU, перебирая рабочие ODBC-драйверы.
+
+    Args:
+        db_config: параметры подключения.
+        database: переопределение БД.
+
+    Returns:
+        Живое ``pyodbc``-соединение (вызывающий закрывает сам).
+
+    Raises:
+        RuntimeError: если ни один кандидат не подключился.
+    """
+    load_dotenv()
+    pyodbc = _require_pyodbc()
+    config = db_config or DbConfig()
+    available = list_available_odbc_drivers()
+    libs = find_msodbcsql_libraries()
+    candidates = candidate_odbc_drivers(config.driver)
+    LOGGER.info(
+        "OISUU ODBC: drivers=%s libs=%s candidates=%s",
+        available,
+        libs,
+        candidates,
+    )
+    if not candidates:
+        raise RuntimeError(
+            "Не найден ODBC-драйвер SQL Server.\n"
+            f"pyodbc.drivers() = {available}\n"
+            f"libmsodbcsql*.so = {libs}\n"
+            "Задай в .env (см. env_template):\n"
+            "  OISUU_ODBC_DRIVER=/usr/lib64/libmsodbcsql-18.so"
+        )
+
+    last_error: Exception | None = None
+    tried: list[str] = []
+    for driver in candidates:
+        tried.append(driver)
+        conn_str = config.connection_string(database, driver=driver)
+        try:
+            connection = pyodbc.connect(conn_str)
+            LOGGER.info("OISUU ODBC OK: %s", driver)
+            return connection
+        except Exception as error:  # pragma: no cover - зависит от окружения
+            last_error = error
+            LOGGER.warning("OISUU ODBC fail (%s): %s", driver, error)
+
+    raise RuntimeError(
+        "Не удалось подключиться к OISUU.\n"
+        f"pyodbc.drivers() = {available}\n"
+        f"libmsodbcsql on disk = {libs}\n"
+        f"Пробовали: {tried}\n"
+        "Если Driver 18 в списке, но 'file not found' — укажи реальный .so в "
+        "OISUU_ODBC_DRIVER (см. env_template).\n"
+        f"Последняя ошибка: {last_error}"
+    ) from last_error
 
 
 def read_sql(
@@ -66,12 +174,11 @@ def read_sql(
     Returns:
         Результат запроса.
     """
-    pyodbc = _require_pyodbc()
+    load_dotenv()
     config = db_config or DbConfig()
-    connection_string = config.connection_string(database)
     LOGGER.info("Чтение из OISUU: %s (database=%s)", config.server, database or config.database)
 
-    with pyodbc.connect(connection_string) as connection:
+    with connect_oisuu(config, database=database) as connection:
         if chunksize is None:
             return pd.read_sql_query(query, connection)
         chunks = list(pd.read_sql_query(query, connection, chunksize=chunksize))

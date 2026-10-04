@@ -27,6 +27,45 @@ FIGURE_DIR = OUTPUT_DIR / "figures"
 for _directory in (DATA_DIR, RAW_DIR, SYNTH_DIR, INTERIM_DIR, OUTPUT_DIR, REPORT_DIR, FIGURE_DIR):
     _directory.mkdir(parents=True, exist_ok=True)
 
+
+def load_dotenv(path: str | Path | None = None, *, override: bool = False) -> Path | None:
+    """Читает ``.env`` в ``os.environ`` без зависимости python-dotenv.
+
+    Args:
+        path: путь к файлу; по умолчанию ``PROJECT_ROOT/.env``.
+        override: перезаписывать ли уже заданные переменные.
+
+    Returns:
+        Путь к прочитанному файлу или ``None``, если файла нет.
+    """
+    env_path = Path(path) if path is not None else PROJECT_ROOT / ".env"
+    if not env_path.exists():
+        return None
+    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if not key:
+            continue
+        if override or key not in os.environ or os.environ.get(key, "") == "":
+            os.environ[key] = value
+    return env_path
+
+
+def _env(*keys: str, default: str = "") -> str:
+    """Первое непустое значение среди ключей окружения."""
+    for key in keys:
+        value = os.getenv(key)
+        if value is not None and value.strip():
+            return value.strip().strip('"').strip("'")
+    return default
+
+
+load_dotenv()
+
 #: Имена промежуточных артефактов (pkl/parquet).
 ARTIFACT_BENEFICIARIES = INTERIM_DIR / "df_beneficiaries.pkl"
 ARTIFACT_LOSSES = INTERIM_DIR / "losses.pkl"
@@ -201,28 +240,45 @@ EXCEL_WORKERS = min(8, (os.cpu_count() or 4))
 class DbConfig:
     """Параметры подключения к OISUU (только для обновления сырых данных)."""
 
-    driver: str = "ODBC Driver 17 for SQL Server"
-    server: str = "oisuu-db-biz.vsk.ru"
-    database: str = "OISUU_report"
-    uid: str = field(default_factory=lambda: os.getenv("OISUU_UID", ""))
-    pwd: str = field(default_factory=lambda: os.getenv("OISUU_PWD", ""))
+    driver: str = field(default_factory=lambda: _env("OISUU_ODBC_DRIVER"))
+    server: str = field(
+        default_factory=lambda: _env("OISUU_SERVER", "OISUU_CONN_HOST", default="oisuu-db-biz.vsk.ru")
+    )
+    database: str = field(
+        default_factory=lambda: _env(
+            "OISUU_DATABASE", "OISUU_CONN_DATABASE", default="OISUU_report"
+        )
+    )
+    uid: str = field(
+        default_factory=lambda: _env("OISUU_UID", "OISUU_CONN_USERNAME")
+    )
+    pwd: str = field(
+        default_factory=lambda: _env("OISUU_PWD", "OISUU_CONN_PASSWORD")
+    )
     trusted_connection: bool = False
 
-    def connection_string(self, database: str | None = None) -> str:
+    def connection_string(
+        self,
+        database: str | None = None,
+        *,
+        driver: str | None = None,
+    ) -> str:
         """Собирает строку подключения pyodbc.
 
         Args:
             database: переопределение БД по умолчанию.
+            driver: имя ODBC-драйвера или путь к ``libmsodbcsql*.so``.
 
         Returns:
             ODBC-строку подключения.
 
         Note:
-            В исходной тетради каталог задавался несуществующим ключом
-            ``incoming_claim_new_logicbase=...`` — корректный ключ ``DATABASE``.
+            На Jupyter VSK часто нет Driver 17; рабочий вариант — Driver 18
+            или прямой путь ``/usr/lib64/libmsodbcsql-18.so`` (см. ``env_template``).
         """
+        resolved_driver = driver or self.driver or "ODBC Driver 18 for SQL Server"
         parts = [
-            f"DRIVER={{{self.driver}}}",
+            f"DRIVER={{{resolved_driver}}}",
             f"SERVER={self.server}",
             f"DATABASE={database or self.database}",
         ]
@@ -232,6 +288,13 @@ class DbConfig:
             parts.append("Trusted_Connection=no")
             parts.append(f"UID={self.uid}")
             parts.append(f"PWD={self.pwd}")
+        low = resolved_driver.lower()
+        if "freetds" in low:
+            parts.append("TDS_Version=7.4")
+        # Driver 18 по умолчанию Encrypt=yes; корп. SQL обычно нужен TrustServerCertificate.
+        if any(token in low for token in ("18", "sql server", "msodbcsql")):
+            parts.append("Encrypt=yes")
+            parts.append("TrustServerCertificate=yes")
         return ";".join(parts) + ";"
 
 

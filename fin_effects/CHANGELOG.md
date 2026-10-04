@@ -2,6 +2,10 @@
 
 ## 2026-10-05
 
+- Что: добавлен `env_template`; `DbConfig` читает `.env`; ODBC для OISUU перебирает `.so` на диске и `pyodbc.drivers()` (как в monitoring: Driver 18 / `libmsodbcsql-18.so`).
+- Зачем: на Jupyter нет Driver 17, из‑за этого падал `load_losses_from_db`.
+- Проверка: `cp env_template .env`, заполнить UID/PWD, при необходимости `OISUU_ODBC_DRIVER=/usr/lib64/libmsodbcsql-18.so`, restart kernel, `SYNTHETIC = False`.
+
 - Что: продовая загрузка в ноутбуке универсальна — Excel из всех `data/raw/<YYYY>/`, `losses`/`cards` из SQL (`load_losses_from_db` / `load_cards_from_db`); `discover_workbooks` сам находит годовые каталоги; `read_sql` склеивает чанки в DataFrame.
 - Зачем: не требовать ручной `losses.pkl` и не жёстко привязываться к одному году вроде 2026.
 - Проверка: `SYNTHETIC = False`, положить xlsx в `data/raw/2024` (и/или другие годы), задать `OISUU_UID`/`OISUU_PWD`, выполнить ячейку источника данных.
