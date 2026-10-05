@@ -31,7 +31,7 @@ from .config import (
     PERSON_COLUMNS,
     PERSON_DATE_PAIRS,
 )
-from .textnorm import build_entity_keys, format_keys, normalize_series
+from .textnorm import build_entity_keys, format_keys, normalize_loss_key, normalize_series
 
 LOGGER = logging.getLogger(__name__)
 
@@ -110,7 +110,7 @@ def normalize_losses(losses: pd.DataFrame) -> pd.DataFrame:
             frame[column] = normalize_series(frame[column])
 
     frame[LOSS_DATE] = pd.to_datetime(frame[LOSS_DATE], errors="coerce")
-    frame[LOSS_KEY] = normalize_series(frame[LOSS_KEY])
+    frame[LOSS_KEY] = normalize_loss_key(frame[LOSS_KEY])
     frame[LOSS_YEAR] = frame[LOSS_DATE].dt.year.astype("Int64")
 
     for column in MONEY_COLUMNS:
@@ -256,16 +256,16 @@ def attach_groups_by_loss_number(
         return pd.DataFrame(columns=[LOSS_KEY, "group_id", "matched_members"])
 
     mapping = beneficiaries.loc[:, ["loss_number", "group_id"]].copy()
-    mapping["loss_number"] = normalize_series(mapping["loss_number"])
+    mapping["loss_number"] = normalize_loss_key(mapping["loss_number"])
     mapping = mapping.loc[mapping["loss_number"].astype(bool)]
     mapping = mapping.drop_duplicates(subset=["loss_number", "group_id"])
     if mapping.empty:
         return pd.DataFrame(columns=[LOSS_KEY, "group_id", "matched_members"])
 
     mapping = mapping.rename(columns={"loss_number": LOSS_KEY})
-    membership = facts.loc[:, [LOSS_KEY]].drop_duplicates().merge(
-        mapping, on=LOSS_KEY, how="inner"
-    )
+    facts_keys = facts.loc[:, [LOSS_KEY]].drop_duplicates().copy()
+    facts_keys[LOSS_KEY] = normalize_loss_key(facts_keys[LOSS_KEY])
+    membership = facts_keys.merge(mapping, on=LOSS_KEY, how="inner")
     membership["matched_members"] = 1
     return membership.loc[:, [LOSS_KEY, "group_id", "matched_members"]]
 

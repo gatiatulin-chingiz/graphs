@@ -15,6 +15,8 @@ import pandas as pd
 
 _WHITESPACE_RE = re.compile(r"[\s\u00a0]+")
 _NON_NAME_RE = re.compile(r"[^\w\s.\-]")
+#: ``float`` → ``"12345.0"`` ломает JOIN с Excel ``"12345"``.
+_TRAILING_DOT_ZERO_RE = re.compile(r"^(\d+)\.0+$")
 
 #: Разделитель, которым склеиваются идентификаторы при построении ключа группы.
 _KEY_SEPARATOR = "\x1f"
@@ -79,6 +81,22 @@ def normalize_series(series: pd.Series) -> pd.Series:
     text = text.str.replace(_NON_NAME_RE, "", regex=True)
     text = text.fillna("").str.strip().str.lower()
     return text.mask(text.isin(_NULL_TOKENS), "").astype("object")
+
+
+def normalize_loss_key(series: pd.Series) -> pd.Series:
+    """Нормализация номера убытка для JOIN Excel ↔ SQL.
+
+    Args:
+        series: номера убытков (``str`` / ``float`` / ``int``).
+
+    Returns:
+        Серия строк без хвостового ``.0`` у целых float.
+    """
+    text = normalize_series(series)
+    if text.empty:
+        return text
+    stripped = text.astype("string").str.replace(_TRAILING_DOT_ZERO_RE, r"\1", regex=True)
+    return stripped.fillna("").astype("object")
 
 
 def normalize_year(value: object) -> float:

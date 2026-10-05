@@ -30,7 +30,7 @@ from .config import (
     EffectParams,
 )
 from .preprocess import LOSS_KEY, LOSS_YEAR, NET_LOSS
-from .textnorm import normalize_series, normalize_text
+from .textnorm import normalize_loss_key, normalize_series, normalize_text
 
 LOGGER = logging.getLogger(__name__)
 
@@ -110,7 +110,7 @@ def loss_detection_dates(cards: pd.DataFrame) -> pd.DataFrame:
     working = cards.loc[:, columns].copy()
     working = working.rename(columns=rename)
     working["card_date"] = pd.to_datetime(working["card_date"], errors="coerce")
-    working[LOSS_KEY] = normalize_series(working[LOSS_KEY])
+    working[LOSS_KEY] = normalize_loss_key(working[LOSS_KEY])
     if "card_stage_raw" in working.columns:
         working["card_stage"] = working["card_stage_raw"].map(normalize_card_stage)
     else:

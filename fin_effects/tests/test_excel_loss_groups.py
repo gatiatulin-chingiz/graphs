@@ -161,6 +161,29 @@ def test_attach_groups_by_loss_number(synthetic) -> None:
     assert paired["LossNumber"].nunique() == 3
 
 
+def test_attach_loss_number_strips_float_dot_zero() -> None:
+    """SQL float LossNumber (123.0) матчится с Excel-строкой «123»."""
+    from fin_effects.preprocess import normalize_losses
+    from fin_effects.textnorm import normalize_loss_key
+
+    assert normalize_loss_key(pd.Series([12345.0, "12345", " 12345.0 "])).tolist() == [
+        "12345",
+        "12345",
+        "12345",
+    ]
+
+    facts = pd.DataFrame({"LossNumber": normalize_loss_key(pd.Series([1001.0, 1002.0]))})
+    beneficiaries = pd.DataFrame(
+        {
+            "group_id": ["g", "g"],
+            "loss_number": ["1001", "1002"],
+            "person_key": ["", ""],
+        }
+    )
+    membership = attach_groups_by_loss_number(facts, beneficiaries)
+    assert set(membership["LossNumber"]) == {"1001", "1002"}
+
+
 def test_attach_unions_person_key_and_loss_number(synthetic) -> None:
     """Union: пары по person_key и по loss_number объединяются."""
     normalized = normalize_losses(synthetic.losses)
