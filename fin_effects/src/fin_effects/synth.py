@@ -74,10 +74,29 @@ _NAMES_FEMALE = (
     "Анна", "Мария", "Елена", "Ольга", "Наталья", "Ирина", "Татьяна", "Светлана",
     "Екатерина", "Юлия", "Ксения", "Дарья", "Людмила", "Галина", "Вера", "Полина",
 )
-_PATRONYMICS = (
-    "Иванович", "Петрович", "Сергеевич", "Андреевич", "Алексеевич", "Николаевич",
-    "Михайлович", "Владимирович", "Дмитриевич", "Юрьевич", "Ивановна", "Петровна",
-    "Сергеевна", "Андреевна", "Алексеевна", "Николаевна", "Михайловна", "Владимировна",
+_PATRONYMICS_MALE = (
+    "Иванович",
+    "Петрович",
+    "Сергеевич",
+    "Андреевич",
+    "Алексеевич",
+    "Николаевич",
+    "Михайлович",
+    "Владимирович",
+    "Дмитриевич",
+    "Юрьевич",
+)
+_PATRONYMICS_FEMALE = (
+    "Ивановна",
+    "Петровна",
+    "Сергеевна",
+    "Андреевна",
+    "Алексеевна",
+    "Николаевна",
+    "Михайловна",
+    "Владимировна",
+    "Дмитриевна",
+    "Юрьевна",
 )
 _VIN_PREFIXES = ("XTA", "XWB", "WVW", "ZFA", "JHM", "KMH", "LJD", "SJN")
 _VIN_ALPHABET = "ABCDEFGHJKLMNPRSTUVWXYZ0123456789"
@@ -251,20 +270,18 @@ class SynthResult:
 
 
 def _random_full_name(rng: random.Random, sex: str) -> str:
-    """Собирает случайное ФИО.
+    """Собирает случайное ФИО одного пола.
 
     Args:
         rng: генератор случайных чисел.
         sex: ``"m"`` или ``"f"``.
 
     Returns:
-        ФИО строкой.
+        ФИО строкой (фамилия, имя и отчество согласованы по роду).
     """
     surname = rng.choice(_SURNAMES) + ("а" if sex == "f" else "")
     name = rng.choice(_NAMES_FEMALE if sex == "f" else _NAMES_MALE)
-    patronymic = rng.choice(_PATRONYMICS)
-    if sex == "f" and patronymic.endswith("вич"):
-        patronymic = patronymic[:-1] + "на"
+    patronymic = rng.choice(_PATRONYMICS_FEMALE if sex == "f" else _PATRONYMICS_MALE)
     return f"{surname} {name} {patronymic}"
 
 

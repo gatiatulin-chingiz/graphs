@@ -404,12 +404,14 @@ def top_fio_by_group(
 def groups_by_status_table(
     group_effect: pd.DataFrame,
     beneficiaries: pd.DataFrame | None = None,
+    top_n: int = 5,
 ) -> pd.DataFrame:
-    """Список групп в работе и закрытых с ключевыми цифрами.
+    """Топ групп в работе и закрытых с ключевыми цифрами.
 
     Args:
         group_effect: таблица эффекта по группам.
         beneficiaries: участники групп — для топ-3 ФИО по частоте ФИО+ДР.
+        top_n: сколько групп показать в каждом статусе (по эффекту).
 
     Returns:
         Таблица ``group_id``, статус, год обнаружения, убыток, эффект и топ ФИО.
@@ -457,9 +459,8 @@ def groups_by_status_table(
             }
         )
         .sort_values(["Статус", "Эффект сервиса, млн ₽"], ascending=[True, False])
-        .reset_index(drop=True)
     )
-    return out
+    return out.groupby("Статус", sort=False).head(top_n).reset_index(drop=True)
 
 
 def status_counts_table(group_effect: pd.DataFrame) -> pd.DataFrame:
@@ -1031,7 +1032,7 @@ def write_html_report(
         ),
         (
             "<section><h2>Группы в работе и закрытые</h2>"
-            "<p class=\"muted\">Список групп по статусу карточки УПС; "
+            "<p class=\"muted\">Топ-5 групп по эффекту в каждом статусе; "
             "топ ФИО — 3 наиболее частых по ключу ФИО+ДР.</p>"
             f"{_df_to_html(groups_list)}</section>"
         ),
