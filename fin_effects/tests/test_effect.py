@@ -75,6 +75,7 @@ def params_fixture() -> EffectParams:
         min_losses_per_year=1,
         first_year=2020,
         last_year=2025,
+        service_start_year=2020,
         project_years=2,
     )
 
@@ -126,9 +127,9 @@ def test_compute_group_effect_values(summary_fixture, params_fixture) -> None:
     assert values.loc["died_before", "effect_total"] == pytest.approx(0.0)
 
     assert stats.groups_total == 3
-    assert stats.groups_alive == 1
-    assert stats.groups_died_after == 1
-    assert stats.groups_died_before == 1
+    assert stats.groups_in_progress == 1
+    assert stats.groups_closed == 1
+    assert stats.groups_no_baseline == 0
 
 
 def test_compute_group_effect_requires_relevance(summary_fixture, params_fixture) -> None:
@@ -152,7 +153,6 @@ def test_effect_matrix_sums_not_averages(summary_fixture, params_fixture) -> Non
     assert matrix.loc[2022, RELEVANCE_DIED_AFTER] == pytest.approx(50_000.0)
     assert matrix.loc[2023, RELEVANCE_ALIVE] == pytest.approx(150_000.0)
     assert matrix.loc[2024, RELEVANCE_ALIVE] == pytest.approx(150_000.0)
-    assert matrix.loc[2024, RELEVANCE_DIED_BEFORE] == pytest.approx(0.0)
     assert matrix["Итого"].sum() == pytest.approx(effect["effect_total"].sum())
 
 
@@ -164,6 +164,7 @@ def test_effect_matrix_respects_last_year() -> None:
         min_losses_per_year=1,
         first_year=2020,
         last_year=2024,
+        service_start_year=2020,
         project_years=5,
     )
     summary = pd.DataFrame([{**ALIVE_GROUP, "detection_year": 2023}])
@@ -192,7 +193,7 @@ def test_effect_by_cohort(summary_fixture, params_fixture) -> None:
     assert set(by_class["detection_year"]) == {2022, 2023, 2024}
     row_2023 = cohort.set_index("detection_year").loc[2023]
     assert row_2023["groups"] == 1
-    assert row_2023["groups_alive"] == 1
+    assert row_2023["groups_in_progress"] == 1
     assert row_2023["effect_projected"] == pytest.approx(300_000.0)
 
 
@@ -204,6 +205,7 @@ def test_effect_by_cohort_aggregates_same_year() -> None:
         min_losses_per_year=1,
         first_year=2020,
         last_year=2025,
+        service_start_year=2020,
         project_years=2,
     )
     summary = pd.DataFrame(
@@ -257,6 +259,7 @@ def test_before_detection_window(synthetic) -> None:
         min_losses_per_year=1,
         first_year=2020,
         last_year=2027,
+        service_start_year=2020,
         baseline_window="before_detection",
     )
     normalized = normalize_losses(synthetic.losses)
@@ -275,6 +278,7 @@ def test_before_detection_window(synthetic) -> None:
         min_losses_per_year=1,
         first_year=2020,
         last_year=2027,
+        service_start_year=2020,
         baseline_window="full",
     )
     full, _ = compute_group_baselines(summary, pairs, full_params)
@@ -310,15 +314,23 @@ def test_baseline_full_versus_before_detection_synthetic(synthetic) -> None:
 
     normalized = normalize_losses(synthetic.losses)
     facts, _ = collapse_losses_to_facts(normalized)
-    facts, _ = filter_observation_period(facts, EffectParams(first_year=2020, last_year=2027))
+    facts, _ = filter_observation_period(facts, EffectParams(first_year=2020, last_year=2027, service_start_year=2020))
     _, pairs = attach_groups_to_losses(facts, synthetic.beneficiaries)
-    summary, _ = build_group_summary(pairs, synthetic.cards, EffectParams(last_year=2027))
-    summary, _ = filter_groups_by_size(summary, EffectParams(last_year=2027))
+    summary, _ = build_group_summary(
+        pairs, synthetic.cards, EffectParams(last_year=2027, service_start_year=2020)
+    )
+    summary, _ = filter_groups_by_size(summary, EffectParams(last_year=2027, service_start_year=2020))
     summary = classify_group_relevance(summary)
 
-    full_params = EffectParams(service_share=1.0, last_year=2027, project_years=1)
+    full_params = EffectParams(
+        service_share=1.0, last_year=2027, project_years=1, service_start_year=2020
+    )
     early_params = EffectParams(
-        service_share=1.0, last_year=2027, project_years=1, baseline_window="before_detection"
+        service_share=1.0,
+        last_year=2027,
+        project_years=1,
+        service_start_year=2020,
+        baseline_window="before_detection",
     )
     full_effect, _ = compute_group_effect(pairs, summary, full_params)
     early_effect, _ = compute_group_effect(pairs, summary, early_params)

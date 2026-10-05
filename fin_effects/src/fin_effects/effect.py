@@ -56,6 +56,34 @@ from .preprocess import GROUP_KEY, LOSS_KEY, LOSS_YEAR, NET_LOSS
 
 LOGGER = logging.getLogger(__name__)
 
+
+def effect_calendar_years(
+    detection_year: int,
+    group_relevance: str,
+    params: EffectParams = DEFAULT_PARAMS,
+) -> list[int]:
+    """Календарные годы, в которые группа даёт эффект сервиса.
+
+    Args:
+        detection_year: год обнаружения (карточка УПС).
+        group_relevance: статус группы.
+        params: параметры методики.
+
+    Returns:
+        Список лет в ``[service_start_year, last_year]``.
+    """
+    years_count = params.project_years if group_relevance == RELEVANCE_IN_PROGRESS else 1
+    years: list[int] = []
+    for offset in range(int(years_count)):
+        year = int(detection_year) + offset
+        if year > params.last_year:
+            break
+        if year < params.service_start_year:
+            continue
+        years.append(year)
+    return years
+
+
 #: Колонки таблицы эффекта по группам.
 GROUP_EFFECT_COLUMNS = (
     "group_id",
@@ -277,22 +305,18 @@ def compute_group_effect(
         frame["mean_loss_per_active_year"] * params.service_share,
         0.0,
     )
-    # Горизонт усекается верхней границей периода наблюдения — иначе
-    # effect_total расходится с матрицей/effect_long при detection близко к last_year.
-    detection = pd.to_numeric(frame["detection_year"], errors="coerce")
-    max_years = (params.last_year - detection + 1).clip(lower=0)
-    in_progress_years = np.minimum(params.project_years, max_years)
-    closed_years = np.minimum(1, max_years)
-    frame["effect_total"] = np.where(
-        frame["group_relevance"] == RELEVANCE_IN_PROGRESS,
-        frame["effect_first_year"] * in_progress_years,
-        np.where(
-            frame["group_relevance"] == RELEVANCE_CLOSED,
-            frame["effect_first_year"] * closed_years,
-            0.0,
-        ),
+    # Число календарных лет эффекта с учётом service_start_year и last_year.
+    year_counts = [
+        len(effect_calendar_years(int(detection), str(relevance), params))
+        if pd.notna(detection)
+        else 0
+        for detection, relevance in zip(
+            frame["detection_year"], frame["group_relevance"], strict=True
+        )
+    ]
+    frame["effect_total"] = frame["effect_first_year"].fillna(0.0) * np.asarray(
+        year_counts, dtype=float
     )
-    frame["effect_total"] = frame["effect_total"].fillna(0.0)
 
     stats = EffectStats(
         groups_total=len(frame),
@@ -332,14 +356,9 @@ def effect_matrix(
     rows: list[dict[str, object]] = []
     for record in group_effect.itertuples(index=False):
         detection_year = int(record.detection_year)
-        is_in_progress = record.group_relevance == RELEVANCE_IN_PROGRESS
-        years = range(
-            detection_year,
-            detection_year + (params.project_years if is_in_progress else 1),
-        )
-        for year in years:
-            if year > params.last_year:
-                continue
+        for year in effect_calendar_years(
+            detection_year, str(record.group_relevance), params
+        ):
             rows.append(
                 {
                     "year": int(year),
@@ -383,13 +402,9 @@ def effect_long(
     rows: list[dict[str, object]] = []
     for record in group_effect.itertuples(index=False):
         detection_year = int(record.detection_year)
-        years_count = (
-            params.project_years if record.group_relevance == RELEVANCE_IN_PROGRESS else 1
-        )
-        for offset in range(years_count):
-            year = detection_year + offset
-            if year > params.last_year:
-                continue
+        for year in effect_calendar_years(
+            detection_year, str(record.group_relevance), params
+        ):
             rows.append(
                 {
                     "group_id": record.group_id,

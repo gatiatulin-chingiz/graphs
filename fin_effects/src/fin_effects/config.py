@@ -93,6 +93,7 @@ class EffectParams:
             считался «активным». ``1`` = любой год с убытками.
         first_year: нижняя граница периода наблюдения по дате убытка.
         last_year: верхняя граница периода наблюдения / горизонт прогноза эффекта.
+        service_start_year: с какого года считаем эффект сервиса (раньше — 0).
         project_years: на сколько лет после года обнаружения проецируется эффект
             (1 = только год обнаружения).
         baseline_window: окно расчёта «среднего годового убытка» группы:
@@ -107,6 +108,7 @@ class EffectParams:
     min_losses_per_year: int = 3
     first_year: int = 2020
     last_year: int = 2025
+    service_start_year: int = 2022
     project_years: int = 2
     baseline_window: str = "full"
     min_years_for_baseline: int = 1
@@ -120,6 +122,8 @@ class EffectParams:
             raise ValueError("last_year должен быть >= first_year")
         if self.project_years < 1:
             raise ValueError("project_years должен быть >= 1")
+        if self.service_start_year > self.last_year:
+            raise ValueError("service_start_year должен быть <= last_year")
 
     @property
     def observation_years(self) -> range:
@@ -146,6 +150,7 @@ RELEVANCE_DIED_BEFORE = "Распалась самостоятельно"  # б�
 
 # ---------------------------------------------------------------------------
 # Палитра САО ВСК (брендбук: синий / светло-синий, логотип #2D2D81)
+# Акцент — бирюза (без жёлтого/оранжевого).
 # ---------------------------------------------------------------------------
 
 VSK_BLUE = "#2D2D81"
@@ -153,7 +158,7 @@ VSK_BLUE_DARK = "#1E1E5A"
 VSK_BLUE_MID = "#3D4FA8"
 VSK_SKY = "#6BA3D9"
 VSK_SKY_SOFT = "#E8F0FA"
-VSK_ACCENT = "#E0922F"
+VSK_ACCENT = "#1A8A8C"
 VSK_MUTED = "#8A93A8"
 VSK_INK = "#1A1A2E"
 

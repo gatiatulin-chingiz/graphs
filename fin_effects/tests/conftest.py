@@ -24,6 +24,7 @@ TEST_PARAMS = EffectParams(
     min_losses_per_year=1,
     first_year=2020,
     last_year=2026,
+    service_start_year=2020,
     project_years=2,
 )
 

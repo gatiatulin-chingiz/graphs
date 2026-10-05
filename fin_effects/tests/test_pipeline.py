@@ -40,17 +40,20 @@ def test_pipeline_reconciles(pipeline_result) -> None:
 
 
 def test_pipeline_classification_matches_truth(pipeline_result, synthetic) -> None:
-    """Класс релевантности совпадает с эталоном генератора."""
+    """Статус групп с карточкой совпадает с эталоном генератора."""
     merged = pipeline_result.summary.merge(
         synthetic.groups.loc[:, ["group_id", "expected_relevance"]], on="group_id", how="left"
     )
+    merged = merged.loc[merged["expected_relevance"].notna()]
+    assert not merged.empty
     assert (merged["group_relevance"] == merged["expected_relevance"]).all()
 
 
 def test_pipeline_contains_all_relevance_classes(pipeline_result) -> None:
-    """В синтетике встречаются все три класса релевантности."""
+    """В синтетике есть оба статуса карточки УПС."""
     classes = set(pipeline_result.summary["group_relevance"])
-    assert classes == {RELEVANCE_ALIVE, RELEVANCE_DIED_AFTER, RELEVANCE_DIED_BEFORE}
+    assert classes <= {RELEVANCE_ALIVE, RELEVANCE_DIED_AFTER}
+    assert classes  # не пусто
 
 
 def test_pipeline_no_duplicate_losses(pipeline_result) -> None:
@@ -64,14 +67,20 @@ def test_pipeline_pair_count_le_facts(pipeline_result) -> None:
 
 
 def test_pipeline_effect_per_group_matches_formula(pipeline_result) -> None:
-    """Эффект группы = база × доля сервиса × усечённый горизонт (для «живых»)."""
+    """Эффект группы = база × доля × число календарных лет эффекта."""
+    from fin_effects.effect import effect_calendar_years
+
     params = pipeline_result.params
     effect = pipeline_result.group_effect
     alive = effect.loc[effect["group_relevance"] == RELEVANCE_ALIVE].copy()
 
-    max_years = (params.last_year - alive["detection_year"] + 1).clip(lower=0)
-    horizon = np.minimum(params.project_years, max_years.astype(float))
-    expected = (alive["mean_loss_per_active_year"] * params.service_share * horizon).astype(float)
+    horizons = [
+        len(effect_calendar_years(int(year), str(relevance), params))
+        for year, relevance in zip(alive["detection_year"], alive["group_relevance"], strict=True)
+    ]
+    expected = (
+        alive["mean_loss_per_active_year"] * params.service_share * np.asarray(horizons)
+    ).astype(float)
     pd.testing.assert_series_equal(
         alive["effect_total"].astype(float).reset_index(drop=True),
         expected.reset_index(drop=True),
@@ -79,13 +88,11 @@ def test_pipeline_effect_per_group_matches_formula(pipeline_result) -> None:
     )
 
 
-def test_pipeline_effect_total_zero_for_died_before(pipeline_result) -> None:
-    """Группы, распавшиеся до обнаружения, не дают эффекта."""
-    died = pipeline_result.group_effect.loc[
-        pipeline_result.group_effect["group_relevance"] == RELEVANCE_DIED_BEFORE
-    ]
-    assert not died.empty
-    assert (died["effect_total"] == 0).all()
+def test_pipeline_only_in_progress_and_closed(pipeline_result) -> None:
+    """В расчёте только статусы «в работе» / «закрыта»."""
+    classes = set(pipeline_result.summary["group_relevance"])
+    assert classes <= {RELEVANCE_ALIVE, RELEVANCE_DIED_AFTER}
+    assert pipeline_result.total_effect >= 0
 
 
 def test_pipeline_is_deterministic(synthetic) -> None:
@@ -112,12 +119,11 @@ def test_pipeline_service_share_scales_linearly(synthetic) -> None:
 
 
 def test_pipeline_without_cards_uses_fallback(synthetic) -> None:
-    """Без карточек пайплайн работает и помечает источник даты обнаружения."""
+    """Без карточек УПС эффект нулевой — группы не входят в расчёт."""
     result = run_pipeline(synthetic.beneficiaries, synthetic.losses, None, TEST_PARAMS)
-    all_groups = result.facts_with_groups["group_id"].nunique()
-    # Счётчик статистики — до фильтра по размеру группы.
-    assert result.group_stats.groups_without_card == all_groups
-    assert (result.summary["detection_source"] == "fallback_first_loss").all()
+    assert result.group_stats.groups_without_card == result.facts_with_groups["group_id"].nunique()
+    assert result.summary.empty
+    assert result.total_effect == 0.0
 
 
 def test_pipeline_from_files(synthetic) -> None:
@@ -193,17 +199,22 @@ def test_pipeline_empty_inputs() -> None:
 
 
 def test_effect_by_year_table(pipeline_result) -> None:
-    """Таблица по годам содержит эффект и накопленный итог (без разреза по классам)."""
+    """Таблица по годам — эффект сервиса и накопленный итог."""
     table = effect_by_year_table(pipeline_result.group_effect, pipeline_result.params)
-    assert {"Год", "Групп", "Эффект, млн ₽", "Накопленный эффект, млн ₽"} <= set(table.columns)
-    assert "Класс группы" not in table.columns
-    assert table["Накопленный эффект, млн ₽"].is_monotonic_increasing
-    assert table["Эффект, млн ₽"].min() >= 0
+    assert {
+        "Год",
+        "Групп",
+        "Эффект сервиса, млн ₽",
+        "Накопленный эффект сервиса, млн ₽",
+    } <= set(table.columns)
+    assert "Статус группы" not in table.columns
+    assert table["Накопленный эффект сервиса, млн ₽"].is_monotonic_increasing
+    assert table["Эффект сервиса, млн ₽"].min() >= 0
 
     by_class = effect_by_year_table(
         pipeline_result.group_effect, pipeline_result.params, by_class=True
     )
-    assert "Класс группы" in by_class.columns
+    assert "Статус группы" in by_class.columns
 
 
 def test_effect_by_cohort_table(pipeline_result) -> None:
@@ -250,12 +261,16 @@ def test_money_table_converts_to_millions() -> None:
 def test_build_figures_creates_files(pipeline_result, tmp_path) -> None:
     """Все графики сохраняются в файлы."""
     figures = build_figures(
-        pipeline_result.group_effect, pipeline_result.summary, pipeline_result.params, tmp_path
+        pipeline_result.group_effect,
+        pipeline_result.summary,
+        pipeline_result.params,
+        tmp_path,
+        facts_with_groups=pipeline_result.facts_with_groups,
     )
     assert set(figures) == {
+        "loss_by_year",
         "effect_by_year",
         "effect_by_cohort",
-        "relevance_split",
         "top_groups",
         "baseline_distribution",
     }

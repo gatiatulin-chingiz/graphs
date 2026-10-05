@@ -41,6 +41,7 @@ from .config import (
 )
 from .effect import effect_long
 from .io_utils import format_money
+from .preprocess import LOSS_KEY, LOSS_YEAR, NET_LOSS
 
 if TYPE_CHECKING:
     from .pipeline import PipelineResult
@@ -95,22 +96,24 @@ def effect_by_year_table(
     *,
     by_class: bool = False,
 ) -> pd.DataFrame:
-    """Эффект по годам.
+    """Эффект сервиса по календарным годам (с ``service_start_year``).
 
     Args:
         group_effect: таблица эффекта по группам.
         params: параметры методики.
-        by_class: если ``True`` — дополнительно разрез по классу релевантности.
+        by_class: если ``True`` — дополнительно разрез по статусу группы.
 
     Returns:
-        Таблица «год [, класс], групп, эффект, накопленный эффект (в млн ₽)».
+        Таблица «год [, статус], групп, эффект сервиса, накопленный (млн ₽)».
     """
     long_frame = effect_long(group_effect, params)
+    effect_col = "Эффект сервиса, млн ₽"
+    cum_col = "Накопленный эффект сервиса, млн ₽"
     if long_frame.empty:
         columns = (
-            ["Год", "Класс группы", "Групп", "Эффект, млн ₽", "Накопленный эффект, млн ₽"]
+            ["Год", "Статус группы", "Групп", effect_col, cum_col]
             if by_class
-            else ["Год", "Групп", "Эффект, млн ₽", "Накопленный эффект, млн ₽"]
+            else ["Год", "Групп", effect_col, cum_col]
         )
         return pd.DataFrame(columns=columns)
 
@@ -119,9 +122,15 @@ def effect_by_year_table(
             long_frame.groupby(["year", "group_relevance"], as_index=False)
             .agg(groups=("group_id", "nunique"), effect=("effect", "sum"))
             .sort_values(["year", "group_relevance"])
-            .rename(columns={"year": "Год", "group_relevance": "Класс группы", "groups": "Групп"})
+            .rename(
+                columns={
+                    "year": "Год",
+                    "group_relevance": "Статус группы",
+                    "groups": "Групп",
+                }
+            )
         )
-        value_columns = ["Год", "Класс группы", "Групп", "Эффект, млн ₽", "Накопленный эффект, млн ₽"]
+        value_columns = ["Год", "Статус группы", "Групп", effect_col, cum_col]
     else:
         grouped = (
             long_frame.groupby("year", as_index=False)
@@ -129,10 +138,10 @@ def effect_by_year_table(
             .sort_values("year")
             .rename(columns={"year": "Год", "groups": "Групп"})
         )
-        value_columns = ["Год", "Групп", "Эффект, млн ₽", "Накопленный эффект, млн ₽"]
+        value_columns = ["Год", "Групп", effect_col, cum_col]
 
-    grouped["Эффект, млн ₽"] = grouped["effect"] / 1_000_000
-    grouped["Накопленный эффект, млн ₽"] = grouped["Эффект, млн ₽"].cumsum()
+    grouped[effect_col] = grouped["effect"] / 1_000_000
+    grouped[cum_col] = grouped[effect_col].cumsum()
     return grouped.loc[:, value_columns]
 
 
@@ -264,13 +273,13 @@ def sensitivity_table(
 
 
 def pipeline_overview_table(result: PipelineResult) -> pd.DataFrame:
-    """Краткие KPI прогона для ноутбука и отчёта.
+    """Краткие KPI прогона с расшифровкой показателей.
 
     Args:
         result: результат :func:`~fin_effects.pipeline.run_pipeline`.
 
     Returns:
-        Таблица «показатель — значение».
+        Таблица «показатель — значение — что это значит».
     """
     groups_in = (
         int(result.beneficiaries["group_id"].nunique())
@@ -284,41 +293,200 @@ def pipeline_overview_table(result: PipelineResult) -> pd.DataFrame:
     )
     kpis = summary_kpis(result.group_effect, result.params)
     stats = result.effect_stats
+    share = result.params.service_share
     return pd.DataFrame(
         [
-            {"Показатель": "Групп в выгрузке сервиса", "Значение": groups_in},
-            {"Показатель": "Групп в расчёте (после порогов)", "Значение": len(result.summary)},
+            {
+                "Показатель": "Групп в выгрузке сервиса",
+                "Значение": groups_in,
+                "Что это": "Сколько файлов/групп пришло из Excel сервиса",
+            },
+            {
+                "Показатель": "Групп в расчёте (после порогов)",
+                "Значение": len(result.summary),
+                "Что это": (
+                    "Группы с карточкой УПС и ≥ "
+                    f"{result.params.min_losses_total} убытков "
+                    "(остальные отброшены)"
+                ),
+            },
             {
                 "Показатель": "Убытков в периоде (факты, уник.)",
                 "Значение": len(result.loss_facts),
+                "Что это": (
+                    f"Уникальные убытки КАСКО за {result.params.first_year}–"
+                    f"{result.params.last_year} после свёртки дублей"
+                ),
             },
             {
                 "Показатель": "Убытков привязано к группам (уник.)",
                 "Значение": unique_matched,
+                "Что это": "Сколько из них совпало с номерами убытков из Excel групп",
             },
-            {"Показатель": "Пар «убыток–группа»", "Значение": len(result.facts_with_groups)},
-            {"Показатель": "Групп: в работе", "Значение": stats.groups_in_progress},
+            {
+                "Показатель": "Пар «убыток–группа»",
+                "Значение": len(result.facts_with_groups),
+                "Что это": "Строк сопоставления (один убыток может быть в нескольких группах)",
+            },
+            {
+                "Показатель": "Групп: в работе",
+                "Значение": stats.groups_in_progress,
+                "Что это": "Карточка УПС в стадии «в работе» — эффект на несколько лет",
+            },
             {
                 "Показатель": "Групп: закрыта",
                 "Значение": stats.groups_closed,
+                "Что это": "Карточка УПС закрыта — эффект на 1 год",
             },
             {
                 "Показатель": "Групп без карточки УПС (вне эффекта)",
                 "Значение": result.group_stats.groups_without_card,
+                "Что это": "Есть в Excel, но нет карточки УПС — эффект не считаем",
             },
             {
                 "Показатель": "Убыток групп за период, млн ₽",
                 "Значение": round(kpis["net_loss_total"] / 1e6, 1),
+                "Что это": "Сколько группы «вынесли» (выплаты − взыскания) за период",
             },
             {
                 "Показатель": "Предотвращённый убыток (база), млн ₽",
                 "Значение": round(kpis["prevented_total"] / 1e6, 1),
+                "Что это": "Сумма средних годовых убытков групп до доли сервиса",
             },
             {
-                "Показатель": f"Эффект сервиса (доля {result.params.service_share:.0%}), млн ₽",
+                "Показатель": f"Эффект сервиса (доля {share:.0%}), млн ₽",
                 "Значение": round(kpis["effect_total"] / 1e6, 1),
+                "Что это": (
+                    f"База × {share:.0%} × годы с {result.params.service_start_year} г."
+                ),
             },
         ]
+    )
+
+
+def top_fio_by_group(
+    beneficiaries: pd.DataFrame,
+    group_ids: pd.Series | list | None = None,
+    top_n: int = 3,
+) -> pd.Series:
+    """Топ ФИО в группе по частоте ключа ФИО+ДР.
+
+    Args:
+        beneficiaries: участники с ``group_id``, ``person_key``, ``full_name``.
+        group_ids: ограничить список групп; ``None`` — все.
+        top_n: сколько имён на группу.
+
+    Returns:
+        Серия ``group_id →`` строка имён через ``; ``.
+    """
+    required = {"group_id", "person_key", "full_name"}
+    if beneficiaries.empty or not required.issubset(beneficiaries.columns):
+        return pd.Series(dtype=str)
+
+    frame = beneficiaries.loc[:, ["group_id", "person_key", "full_name"]].copy()
+    frame["person_key"] = frame["person_key"].astype(str).str.strip()
+    frame["full_name"] = frame["full_name"].astype(str).str.strip()
+    frame = frame.loc[frame["person_key"].astype(bool) & frame["full_name"].astype(bool)]
+    if group_ids is not None:
+        frame = frame.loc[frame["group_id"].isin(group_ids)]
+    if frame.empty:
+        return pd.Series(dtype=str)
+
+    ranked = (
+        frame.groupby(["group_id", "person_key"], as_index=False)
+        .agg(full_name=("full_name", "first"), n=("person_key", "size"))
+        .sort_values(["group_id", "n", "full_name"], ascending=[True, False, True])
+    )
+    top = ranked.groupby("group_id", sort=False).head(top_n)
+    return top.groupby("group_id")["full_name"].agg(lambda names: "; ".join(names.tolist()))
+
+
+def groups_by_status_table(
+    group_effect: pd.DataFrame,
+    beneficiaries: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    """Список групп в работе и закрытых с ключевыми цифрами.
+
+    Args:
+        group_effect: таблица эффекта по группам.
+        beneficiaries: участники групп — для топ-3 ФИО по частоте ФИО+ДР.
+
+    Returns:
+        Таблица ``group_id``, статус, год обнаружения, убыток, эффект и топ ФИО.
+    """
+    columns = [
+        "Статус",
+        "group_id",
+        "Год обнаружения",
+        "Убытков",
+        "Убыток, млн ₽",
+        "Эффект сервиса, млн ₽",
+        "Топ ФИО",
+    ]
+    if group_effect.empty:
+        return pd.DataFrame(columns=columns)
+
+    frame = group_effect.copy()
+    frame["Убыток, млн ₽"] = frame["net_loss_total"] / 1e6
+    frame["Эффект сервиса, млн ₽"] = frame["effect_total"] / 1e6
+    if beneficiaries is not None and not beneficiaries.empty:
+        frame["Топ ФИО"] = frame["group_id"].map(
+            top_fio_by_group(beneficiaries, frame["group_id"])
+        )
+    else:
+        frame["Топ ФИО"] = ""
+    frame["Топ ФИО"] = frame["Топ ФИО"].fillna("")
+    out = (
+        frame.loc[
+            :,
+            [
+                "group_relevance",
+                "group_id",
+                "detection_year",
+                "losses_total",
+                "Убыток, млн ₽",
+                "Эффект сервиса, млн ₽",
+                "Топ ФИО",
+            ],
+        ]
+        .rename(
+            columns={
+                "group_relevance": "Статус",
+                "detection_year": "Год обнаружения",
+                "losses_total": "Убытков",
+            }
+        )
+        .sort_values(["Статус", "Эффект сервиса, млн ₽"], ascending=[True, False])
+        .reset_index(drop=True)
+    )
+    return out
+
+
+def status_counts_table(group_effect: pd.DataFrame) -> pd.DataFrame:
+    """Сколько групп в работе / закрыто и суммы эффекта."""
+    if group_effect.empty:
+        return pd.DataFrame(columns=["Статус", "Групп", "Убыток, млн ₽", "Эффект сервиса, млн ₽"])
+    return (
+        group_effect.groupby("group_relevance", as_index=False)
+        .agg(
+            groups=("group_id", "nunique"),
+            net_loss=("net_loss_total", "sum"),
+            effect=("effect_total", "sum"),
+        )
+        .rename(
+            columns={
+                "group_relevance": "Статус",
+                "groups": "Групп",
+                "net_loss": "Убыток, млн ₽",
+                "effect": "Эффект сервиса, млн ₽",
+            }
+        )
+        .assign(**{
+            "Убыток, млн ₽": lambda frame: frame["Убыток, млн ₽"] / 1e6,
+            "Эффект сервиса, млн ₽": lambda frame: frame["Эффект сервиса, млн ₽"] / 1e6,
+        })
+        .sort_values("Групп", ascending=False)
+        .reset_index(drop=True)
     )
 
 
@@ -443,9 +611,107 @@ def plot_effect_by_year(
             color=VSK_BLUE_DARK,
         )
 
-    ax.set_title("Финансовый эффект по годам")
+    ax.set_title("Эффект сервиса по календарным годам")
     ax.set_xlabel("Год")
-    ax.set_ylabel("Эффект, млн ₽")
+    ax.set_ylabel("Эффект сервиса, млн ₽")
+    _style_axes(ax)
+    return _finish_figure(fig, target)
+
+
+def loss_by_year_detected_frame(
+    facts_with_groups: pd.DataFrame,
+    group_effect: pd.DataFrame,
+) -> pd.DataFrame:
+    """Убыток групп по календарным годам: всего и по обнаруженным.
+
+    Args:
+        facts_with_groups: пары «убыток–группа».
+        group_effect: группы с карточкой УПС (обнаруженные).
+
+    Returns:
+        Таблица ``year``, ``net_loss_total``, ``net_loss_detected``.
+    """
+    if facts_with_groups.empty or not {
+        LOSS_KEY,
+        LOSS_YEAR,
+        NET_LOSS,
+        "group_id",
+    }.issubset(facts_with_groups.columns):
+        return pd.DataFrame(columns=["year", "net_loss_total", "net_loss_detected"])
+
+    detected_ids = (
+        set(group_effect["group_id"].tolist())
+        if not group_effect.empty and "group_id" in group_effect.columns
+        else set()
+    )
+    working = facts_with_groups.loc[:, [LOSS_KEY, LOSS_YEAR, NET_LOSS, "group_id"]].copy()
+    working["_detected"] = working["group_id"].isin(detected_ids)
+    per_loss = (
+        working.groupby(LOSS_KEY, as_index=False)
+        .agg(
+            year=(LOSS_YEAR, "min"),
+            net_loss=(NET_LOSS, "first"),
+            detected=("_detected", "any"),
+        )
+    )
+    total = per_loss.groupby("year", as_index=False)["net_loss"].sum().rename(
+        columns={"net_loss": "net_loss_total"}
+    )
+    detected = (
+        per_loss.loc[per_loss["detected"]]
+        .groupby("year", as_index=False)["net_loss"]
+        .sum()
+        .rename(columns={"net_loss": "net_loss_detected"})
+    )
+    return (
+        total.merge(detected, on="year", how="left")
+        .fillna({"net_loss_detected": 0.0})
+        .sort_values("year")
+        .reset_index(drop=True)
+    )
+
+
+def plot_loss_by_year(
+    facts_with_groups: pd.DataFrame,
+    group_effect: pd.DataFrame,
+    path: Path | None = None,
+) -> Path:
+    """Сколько выносят по годам и какая доля у обнаруженных групп.
+
+    Args:
+        facts_with_groups: пары «убыток–группа».
+        group_effect: обнаруженные группы (с карточкой УПС).
+        path: куда сохранить PNG.
+
+    Returns:
+        Путь к картинке.
+    """
+    target = path or FIGURE_DIR / "loss_by_year.png"
+    frame = loss_by_year_detected_frame(facts_with_groups, group_effect)
+    fig, ax = plt.subplots(figsize=(9, 4.5))
+    if frame.empty:
+        ax.text(0.5, 0.5, "Нет данных", ha="center", va="center")
+        return _finish_figure(fig, target)
+
+    years = frame["year"].astype(int).astype(str)
+    x_pos = np.arange(len(years))
+    width = 0.38
+    total = frame["net_loss_total"].to_numpy() / 1_000_000
+    detected = frame["net_loss_detected"].to_numpy() / 1_000_000
+    ax.bar(x_pos - width / 2, total, width, label="Вынесли (все группы)", color=VSK_BLUE)
+    ax.bar(
+        x_pos + width / 2,
+        detected,
+        width,
+        label="Из них обнаружено (есть карточка УПС)",
+        color=VSK_ACCENT,
+    )
+    ax.set_xticks(x_pos)
+    ax.set_xticklabels(years)
+    ax.set_title("Убыток групп по годам: вынесли и обнаружено")
+    ax.set_xlabel("Год убытка")
+    ax.set_ylabel("Убыток, млн ₽")
+    ax.legend(frameon=False)
     _style_axes(ax)
     return _finish_figure(fig, target)
 
@@ -523,7 +789,7 @@ def plot_relevance_split(summary: pd.DataFrame, path: Path | None = None) -> Pat
         textprops={"fontsize": 8, "color": VSK_INK},
         wedgeprops={"linewidth": 1, "edgecolor": "white"},
     )
-    ax.set_title("Группы по классам релевантности", color=VSK_BLUE_DARK)
+    ax.set_title("Группы по статусу карточки УПС", color=VSK_BLUE_DARK)
     return _finish_figure(fig, target)
 
 
@@ -610,6 +876,7 @@ def build_figures(
     summary: pd.DataFrame,
     params: EffectParams = DEFAULT_PARAMS,
     figures_dir: Path = FIGURE_DIR,
+    facts_with_groups: pd.DataFrame | None = None,
 ) -> dict[str, Path]:
     """Строит полный комплект графиков.
 
@@ -618,17 +885,21 @@ def build_figures(
         summary: сводка по группам.
         params: параметры методики.
         figures_dir: каталог для картинок.
+        facts_with_groups: пары «убыток–группа» для графика убытков по годам.
 
     Returns:
         Словарь «имя графика -> путь».
     """
     figures_dir.mkdir(parents=True, exist_ok=True)
+    facts = facts_with_groups if facts_with_groups is not None else pd.DataFrame()
     return {
+        "loss_by_year": plot_loss_by_year(
+            facts, group_effect, figures_dir / "loss_by_year.png"
+        ),
         "effect_by_year": plot_effect_by_year(group_effect, params, figures_dir / "effect_by_year.png"),
         "effect_by_cohort": plot_effect_by_cohort(
             group_effect, params, figures_dir / "effect_by_cohort.png"
         ),
-        "relevance_split": plot_relevance_split(summary, figures_dir / "relevance_split.png"),
         "top_groups": plot_top_groups(group_effect, 15, figures_dir / "top_groups.png"),
         "baseline_distribution": plot_baseline_distribution(
             group_effect, figures_dir / "baseline_distribution.png"
@@ -726,7 +997,11 @@ def write_html_report(
     params = result.params
     kpis = summary_kpis(result.group_effect, params)
     figure_paths = figures or build_figures(
-        result.group_effect, result.summary, params, FIGURE_DIR
+        result.group_effect,
+        result.summary,
+        params,
+        FIGURE_DIR,
+        facts_with_groups=result.facts_with_groups,
     )
 
     def _figure_section(key: str, title: str) -> str:
@@ -743,23 +1018,39 @@ def write_html_report(
         )
 
     year_table = effect_by_year_table(result.group_effect, params, by_class=False)
+    status_summary = status_counts_table(result.group_effect)
+    groups_list = groups_by_status_table(result.group_effect, result.beneficiaries)
+    overview = pipeline_overview_table(result)
+    stats = result.effect_stats
+
     sections_html = [
         (
-            "<section><h2>Топ групп по эффекту</h2>"
-            f"{_df_to_html(top_groups_table(result.group_effect, top_n=20))}</section>"
+            "<section><h2>Кратко</h2>"
+            "<p class=\"muted\">Сколько групп ведём, сколько вынесли, какой эффект сервиса.</p>"
+            f"{_df_to_html(status_summary)}</section>"
         ),
-        _figure_section("top_groups", "Топ групп по эффекту — график"),
         (
-            "<section><h2>Эффект по годам</h2>"
+            "<section><h2>Группы в работе и закрытые</h2>"
+            "<p class=\"muted\">Список групп по статусу карточки УПС; "
+            "топ ФИО — 3 наиболее частых по ключу ФИО+ДР.</p>"
+            f"{_df_to_html(groups_list)}</section>"
+        ),
+        _figure_section("loss_by_year", "Убыток групп по годам: вынесли и обнаружено"),
+        (
+            "<section><h2>Эффект сервиса по календарным годам</h2>"
+            "<p class=\"muted\">"
+            f"Финансовый эффект графового сервиса по годам "
+            f"(с {params.service_start_year} г., когда сервис запустился). "
+            "Не путать с годом обнаружения группы."
+            "</p>"
             f"{_df_to_html(year_table)}</section>"
         ),
-        _figure_section("effect_by_year", "Эффект по годам — график"),
+        _figure_section("effect_by_year", "Эффект сервиса по годам — график"),
         (
             "<section><h2>Сводка прогона</h2>"
-            f"{_df_to_html(pipeline_overview_table(result))}</section>"
+            "<p class=\"muted\">Расшифровка промежуточных чисел пайплайна.</p>"
+            f"{_df_to_html(overview)}</section>"
         ),
-        _figure_section("relevance_split", "Распределение групп по классам"),
-        _figure_section("baseline_distribution", "Распределение базы эффекта"),
     ]
     body_sections = "\n".join(block for block in sections_html if block)
 
@@ -840,8 +1131,8 @@ def write_html_report(
       margin-top: 4px;
       color: var(--vsk-blue);
     }}
-    .kpi:last-child {{ border-top-color: var(--vsk-accent); }}
-    .kpi:last-child .value {{ color: var(--vsk-accent); }}
+    .kpi.accent {{ border-top-color: var(--vsk-accent); }}
+    .kpi.accent .value {{ color: var(--vsk-accent); }}
     section {{
       background: var(--card);
       border: 1px solid var(--line);
@@ -860,7 +1151,7 @@ def write_html_report(
       border-bottom: 1px solid var(--line);
       padding: 8px 10px;
       text-align: left;
-      white-space: nowrap;
+      white-space: normal;
     }}
     table.data th {{
       background: var(--vsk-blue);
@@ -893,23 +1184,23 @@ def write_html_report(
       Сформировано: {html.escape(generated_at)}.
       Параметры: доля сервиса {params.service_share:.0%},
       горизонт {params.project_years} г.,
-      период {params.first_year}–{params.last_year},
-      baseline={html.escape(params.baseline_window)}.
+      эффект с {params.service_start_year} г.,
+      период убытков {params.first_year}–{params.last_year}.
     </p>
     <div class="kpis">
-      <div class="kpi"><div class="label">Групп в расчёте</div>
-        <div class="value">{kpis["groups"]:.0f}</div></div>
-      <div class="kpi"><div class="label">Убыток групп, млн руб.</div>
+      <div class="kpi"><div class="label">Групп в работе</div>
+        <div class="value">{stats.groups_in_progress}</div></div>
+      <div class="kpi"><div class="label">Групп закрыто</div>
+        <div class="value">{stats.groups_closed}</div></div>
+      <div class="kpi"><div class="label">Вынесли (убыток групп), млн руб.</div>
         <div class="value">{kpis["net_loss_total"] / 1e6:,.1f}</div></div>
-      <div class="kpi"><div class="label">Предотвращённый убыток (база), млн руб.</div>
-        <div class="value">{kpis["prevented_total"] / 1e6:,.1f}</div></div>
-      <div class="kpi"><div class="label">Финансовый эффект, млн руб.</div>
+      <div class="kpi accent"><div class="label">Эффект сервиса, млн руб.</div>
         <div class="value">{kpis["effect_total"] / 1e6:,.1f}</div></div>
     </div>
     {body_sections}
     <footer>
       Сверка матрицы с итогом по группам: расхождение {delta:,.2f} руб.
-      Итоговый эффект: {result.total_effect:,.0f} руб.
+      Итоговый эффект сервиса: {result.total_effect:,.0f} руб.
     </footer>
   </main>
 </body>

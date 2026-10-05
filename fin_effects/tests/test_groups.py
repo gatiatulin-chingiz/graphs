@@ -62,12 +62,12 @@ def test_loss_detection_dates_requires_columns() -> None:
 
 
 def test_build_group_summary_matches_ground_truth(synthetic, facts_with_groups) -> None:
-    """Гранулярность сводки — одна строка на группу, наборы групп совпадают."""
+    """Гранулярность сводки — одна строка на группу с карточкой УПС."""
     summary, _ = build_group_summary(facts_with_groups, synthetic.cards, TEST_PARAMS)
     assert summary["group_id"].is_unique
-    assert set(summary["group_id"]) == set(facts_with_groups["group_id"])
+    assert set(summary["group_id"]).issubset(set(facts_with_groups["group_id"]))
     assert (summary["losses_total"] >= 1).all()
-    assert (summary["active_years_count"] <= summary["lifetime_years"]).all()
+    assert summary["detection_date"].notna().all()
 
 
 def test_build_group_summary_detection_matches_truth(synthetic, facts_with_groups) -> None:
@@ -80,15 +80,10 @@ def test_build_group_summary_detection_matches_truth(synthetic, facts_with_group
 
 
 def test_build_group_summary_fallback_without_cards(synthetic, facts_with_groups) -> None:
-    """Без карточек год обнаружения берётся по первому убытку группы."""
+    """Без карточек группы не попадают в расчёт эффекта."""
     summary, stats = build_group_summary(facts_with_groups, None, TEST_PARAMS)
-    assert not summary.empty
-    all_groups = facts_with_groups["group_id"].nunique()
-    # Счётчик статистики считается до фильтра по размеру группы, поэтому
-    # сравниваем его с числом групп во входных данных, а не в сводке.
-    assert stats.groups_without_card == all_groups
-    assert (summary["detection_source"] == "fallback_first_loss").all()
-    assert (summary["detection_year"].astype(int) == summary["first_loss_year"]).all()
+    assert summary.empty
+    assert stats.groups_without_card == facts_with_groups["group_id"].nunique()
 
 
 def test_build_group_summary_empty_input() -> None:
@@ -99,29 +94,31 @@ def test_build_group_summary_empty_input() -> None:
 
 
 def test_classify_group_relevance_rules() -> None:
-    """Классы присваиваются по годам жизни группы."""
+    """Статус берётся из стадии карточки УПС."""
     summary = pd.DataFrame(
         {
-            "group_id": ["alive", "died_after", "died_before"],
+            "group_id": ["open", "closed", "unknown"],
+            "card_stage": [RELEVANCE_ALIVE, RELEVANCE_DIED_AFTER, None],
             "detection_year": [2022, 2023, 2024],
-            "last_loss_year": [2024, 2023, 2021],
         }
     )
     classified = classify_group_relevance(summary)
     result = classified.set_index("group_id")["group_relevance"]
-    assert result["alive"] == RELEVANCE_ALIVE
-    assert result["died_after"] == RELEVANCE_DIED_AFTER
-    assert result["died_before"] == RELEVANCE_DIED_BEFORE
+    assert result["open"] == RELEVANCE_ALIVE
+    assert result["closed"] == RELEVANCE_DIED_AFTER
+    assert "unknown" not in result.index
 
 
-def test_classify_group_relevance_shift() -> None:
-    """Параметр alive_year_shift меняет границу «действует/распалась»."""
+def test_classify_group_relevance_from_raw_stage() -> None:
+    """Сырые стадии «В работе» / «Закрыта» нормализуются."""
     summary = pd.DataFrame(
-        {"group_id": ["g"], "detection_year": [2022], "last_loss_year": [2023]}
+        {"group_id": ["g"], "card_stage": ["В работе"], "detection_year": [2022]}
     )
     assert classify_group_relevance(summary).loc[0, "group_relevance"] == RELEVANCE_ALIVE
-    shifted = classify_group_relevance(summary, alive_year_shift=1)
-    assert shifted.loc[0, "group_relevance"] == RELEVANCE_DIED_AFTER
+    closed = pd.DataFrame(
+        {"group_id": ["g"], "card_stage": ["Закрыта"], "detection_year": [2022]}
+    )
+    assert classify_group_relevance(closed).loc[0, "group_relevance"] == RELEVANCE_DIED_AFTER
 
 
 def test_classify_group_relevance_matches_reference(synthetic, facts_with_groups) -> None:
@@ -132,6 +129,8 @@ def test_classify_group_relevance_matches_reference(synthetic, facts_with_groups
     merged = classified.merge(
         synthetic.groups.loc[:, ["group_id", "expected_relevance"]], on="group_id", how="left"
     )
+    merged = merged.loc[merged["expected_relevance"].notna()]
+    assert not merged.empty
     assert (merged["group_relevance"] == merged["expected_relevance"]).all()
 
 
@@ -165,7 +164,7 @@ def test_year_matrix() -> None:
     summary = pd.DataFrame(
         {
             "group_id": ["g1", "g2"],
-            "group_relevance": [RELEVANCE_ALIVE, RELEVANCE_DIED_BEFORE],
+            "group_relevance": [RELEVANCE_ALIVE, RELEVANCE_DIED_AFTER],
             "detection_year": [2022, 2023],
             "active_years": [(2021, 2022), (2023,)],
         }

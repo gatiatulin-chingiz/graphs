@@ -63,6 +63,7 @@ MIN_LOSSES_TOTAL = 3
 MIN_LOSSES_PER_YEAR = 3
 FIRST_YEAR = 2020
 LAST_YEAR = 2026
+SERVICE_START_YEAR = 2022  # сервис запустился в 2022 — эффект раньше не считаем
 
 PARAMS = EffectParams(
     service_share=SERVICE_SHARE,
@@ -71,6 +72,7 @@ PARAMS = EffectParams(
     min_losses_per_year=MIN_LOSSES_PER_YEAR,
     first_year=FIRST_YEAR,
     last_year=LAST_YEAR,
+    service_start_year=SERVICE_START_YEAR,
     baseline_window="full",
 )
 print("Проект:", PROJECT_ROOT.resolve())
@@ -133,15 +135,20 @@ pipeline_overview_table(result)"""
     )
 
     markdown(
-        """## 4. Классы групп и эффект по годам
+        """## 4. Статусы групп и эффект сервиса по годам
 
 * **Группа в работе** — стадия карточки УПС «в работе» → эффект на `project_years` лет.
 * **Группа закрыта** — стадия «закрыта» → эффект на 1 год.
 * Без карточки УПС группа в расчёт **не** входит.
-* Колонка «Убытков (Σ по группам)» может завышать; смотрите «уник.»."""
+* Эффект сервиса считаем только с `SERVICE_START_YEAR` (запуск сервиса)."""
     )
     code(
-        """headcount_table(result.summary, result.facts_with_groups)"""
+        """from fin_effects.reporting import groups_by_status_table, status_counts_table
+
+status_counts_table(result.group_effect)"""
+    )
+    code(
+        """groups_by_status_table(result.group_effect).head(40)"""
     )
     code(
         """effect_by_year_table(result.group_effect, PARAMS)"""
@@ -153,7 +160,13 @@ pipeline_overview_table(result)"""
 Файл по умолчанию: **`outputs/reports/financial_effect.html`** (от корня `fin_effects`)."""
     )
     code(
-        """figures = build_figures(result.group_effect, result.summary, PARAMS, FIGURE_DIR)
+        """figures = build_figures(
+    result.group_effect,
+    result.summary,
+    PARAMS,
+    FIGURE_DIR,
+    facts_with_groups=result.facts_with_groups,
+)
 html_path = write_html_report(
     result,
     REPORT_DIR / "financial_effect.html",

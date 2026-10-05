@@ -51,6 +51,7 @@ def main() -> int:
         project_years=args.project_years,
         first_year=args.first_year,
         last_year=args.last_year,
+        service_start_year=max(args.first_year, 2022),
         min_losses_total=3,
         min_losses_per_year=3,
         baseline_window="full",
@@ -66,7 +67,12 @@ def main() -> int:
     started = time.perf_counter()
     data = generate_synthetic_data(config)
     result = run_pipeline(data.beneficiaries, data.losses, data.cards, params, persist=True)
-    figures = build_figures(result.group_effect, result.summary, params)
+    figures = build_figures(
+        result.group_effect,
+        result.summary,
+        params,
+        facts_with_groups=result.facts_with_groups,
+    )
     report_path = write_html_report(
         result,
         args.output,
