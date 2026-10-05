@@ -2,6 +2,10 @@
 
 ## 2026-10-05
 
+- Что: из `LOSSES_QUERY` убран JOIN к `oisuu81_t_IncidentCharacteristics` / колонка `IncidentNumber`.
+- Зачем: на текущем OISUU объекта нет (`Invalid object name`), а в пайплайне эффекта `IncidentNumber` не используется.
+- Проверка: `load_losses_from_db()` при `SYNTHETIC = False`.
+
 - Что: в legacy-сравнении ноутбука колонка группы берётся как `group_id` (а не `group_number`).
 - Зачем: в продовом Excel после `load_beneficiaries` есть только `group_id`; `group_number` есть лишь у синтетики.
 - Проверка: ячейка «исходная логика против исправленной» при `SYNTHETIC = False`.

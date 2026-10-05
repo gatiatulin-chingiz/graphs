@@ -10,7 +10,9 @@
 * агрегаты по ПСР/претензиям берутся из подзапроса с ``GROUP BY``, а не джойнятся
   построчно (иначе суммы размножаются по числу строк платежей/претензий);
 * платежи агрегируются до одного значения на убыток (``SUM(ValueRub)``), чтобы
-  ``ValueRub`` не дублировался при нескольких выплатах по одному убытку.
+  ``ValueRub`` не дублировался при нескольких выплатах по одному убытку;
+* JOIN к ``oisuu81_t_IncidentCharacteristics`` убран: на текущем OISUU таблицы нет,
+  а ``IncidentNumber`` в расчёте эффекта не используется.
 """
 
 from __future__ import annotations
@@ -36,7 +38,6 @@ psr_agg AS (
     GROUP BY psr.[Номер_убытка]
 )
 SELECT
-    ich.[IncidentNumber],
     l.[LossNumber],
     l.[LossDateTime],
 
@@ -77,8 +78,6 @@ SELECT
     psr.[Сумма_взыскано_по_ФУ],
     psr.[Суммы_взыскано_по_иску]
 FROM [OISUU_report].[dbo].[oisuu81_t_Losses] AS l
-LEFT JOIN [OISUU_report].[dbo].[oisuu81_t_IncidentCharacteristics] AS ich
-       ON ich.LossID = l.LossID
 LEFT JOIN psr_agg AS psr
        ON psr.LossNumber = l.[LossNumber]
 LEFT JOIN payment_agg AS pay
