@@ -52,6 +52,10 @@ class BeneficiaryLoadStats:
     sheets_skipped: int = 0
     rows: int = 0
     errors: tuple[str, ...] = ()
+    sheets_with_ubytok: int = 0
+    colored_rows: int = 0
+    loss_numbers: int = 0
+    person_keys: int = 0
 
     def as_text(self) -> str:
         """Человекочитаемая сводка.
@@ -59,11 +63,18 @@ class BeneficiaryLoadStats:
         Returns:
             Строка для логов ноутбука.
         """
-        return (
+        base = (
             f"файлов: {self.files}, листов: {self.sheets_ok}/{self.sheets_total} "
             f"(пропущено {self.sheets_skipped}), строк: {self.rows}, "
             f"ошибок: {len(self.errors)}"
         )
+        if self.sheets_with_ubytok or self.colored_rows:
+            base += (
+                f"; prod: листов с Убыток={self.sheets_with_ubytok}, "
+                f"цветных строк={self.colored_rows}, "
+                f"номеров убытков={self.loss_numbers}, person_key={self.person_keys}"
+            )
+        return base
 
 
 def discover_year_dirs(root: str | Path) -> list[Path]:
@@ -237,7 +248,7 @@ def _empty_beneficiaries() -> pd.DataFrame:
     Returns:
         Пустой ``DataFrame`` с колонками :data:`OUTPUT_COLUMNS` + ``person_key``.
     """
-    return pd.DataFrame(columns=(*OUTPUT_COLUMNS, "person_key"))
+    return pd.DataFrame(columns=(*OUTPUT_COLUMNS, "person_key", "loss_number"))
 
 
 def read_beneficiary_file(
@@ -246,15 +257,47 @@ def read_beneficiary_file(
 ) -> tuple[pd.DataFrame, BeneficiaryLoadStats]:
     """Читает один файл выгрузки сервиса.
 
+    Сначала пробует **prod**-формат (колонка «Убыток» + цветные строки через
+    ``openpyxl``). Если ничего не извлечено — fallback на legacy-листы
+    «ФИО / ДР / группа» через :func:`parse_sheet`.
+
     Args:
         path: путь к xlsx/xls.
-        engine: движок чтения (``openpyxl``/``calamine``).
+        engine: движок чтения (``openpyxl``/``calamine``) для legacy-fallback.
 
     Returns:
         Кортеж «таблица участников, статистика». Ошибки чтения не приводят к
         падению: файл попадает в ``stats.errors``.
     """
     path = Path(path)
+    group_id = path.stem
+
+    # --- prod: широкие таблицы с «Убыток» и цветными строками ---
+    if path.suffix.lower() in {".xlsx", ".xlsm"}:
+        try:
+            from .excel_loss_groups import read_prod_workbook
+
+            prod_frame, prod_stats = read_prod_workbook(path)
+            if not prod_frame.empty:
+                # Приводим к схеме, совместимой с legacy (source_* уже есть)
+                if "loss_number" not in prod_frame.columns:
+                    prod_frame["loss_number"] = ""
+                stats = BeneficiaryLoadStats(
+                    files=1,
+                    sheets_total=prod_stats.sheets_with_ubytok + prod_stats.skipped_no_header,
+                    sheets_ok=prod_stats.sheets_with_ubytok,
+                    sheets_skipped=prod_stats.skipped_no_header,
+                    rows=len(prod_frame),
+                    sheets_with_ubytok=prod_stats.sheets_with_ubytok,
+                    colored_rows=prod_stats.colored_rows,
+                    loss_numbers=prod_stats.loss_numbers,
+                    person_keys=prod_stats.person_keys,
+                )
+                return prod_frame, stats
+        except Exception as error:  # noqa: BLE001
+            LOGGER.warning("Prod-парсер не смог прочитать %s: %s — fallback", path.name, error)
+
+    # --- legacy: 3 колонки ФИО / ДР / группа ---
     frames: list[pd.DataFrame] = []
     errors: list[str] = []
     sheets_total = 0
@@ -266,13 +309,14 @@ def read_beneficiary_file(
                 sheets_total += 1
                 try:
                     raw_sheet = workbook.parse(sheet_name=sheet_name, header=None)
-                    parsed = parse_sheet(raw_sheet, group_id=str(path.stem))
+                    parsed = parse_sheet(raw_sheet, group_id=group_id)
                     if parsed.empty:
                         sheets_skipped += 1
                         LOGGER.debug("Лист без участников: %s / %s", path.name, sheet_name)
                         continue
                     parsed["source_file"] = path.name
                     parsed["source_sheet"] = sheet_name
+                    parsed["loss_number"] = ""
                     frames.append(parsed)
                 except Exception as error:  # noqa: BLE001 - данные бывают любые
                     sheets_skipped += 1
@@ -285,6 +329,8 @@ def read_beneficiary_file(
         LOGGER.error("Не удалось открыть файл %s", message)
 
     frame = pd.concat(frames, ignore_index=True) if frames else _empty_beneficiaries()
+    if not frame.empty and "loss_number" not in frame.columns:
+        frame["loss_number"] = ""
     stats = BeneficiaryLoadStats(
         files=1,
         sheets_total=sheets_total,
@@ -328,6 +374,9 @@ def load_beneficiaries(
     if group_by_file and not combined.empty:
         combined["group_id"] = combined["source_file"].map(_file_group_id)
 
+    if not combined.empty and "loss_number" not in combined.columns:
+        combined["loss_number"] = ""
+
     stats = BeneficiaryLoadStats(
         files=sum(stat.files for _, stat in results),
         sheets_total=sum(stat.sheets_total for _, stat in results),
@@ -335,6 +384,10 @@ def load_beneficiaries(
         sheets_skipped=sum(stat.sheets_skipped for _, stat in results),
         rows=len(combined),
         errors=tuple(error for _, stat in results for error in stat.errors),
+        sheets_with_ubytok=sum(stat.sheets_with_ubytok for _, stat in results),
+        colored_rows=sum(stat.colored_rows for _, stat in results),
+        loss_numbers=sum(stat.loss_numbers for _, stat in results),
+        person_keys=sum(stat.person_keys for _, stat in results),
     )
     LOGGER.info("Загрузка выгрузок сервиса: %s", stats.as_text())
     return combined, stats

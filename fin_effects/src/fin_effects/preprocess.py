@@ -239,19 +239,50 @@ def build_beneficiary_lookup(beneficiaries: pd.DataFrame) -> pd.DataFrame:
     return lookup.drop_duplicates().reset_index(drop=True)
 
 
+def attach_groups_by_loss_number(
+    facts: pd.DataFrame,
+    beneficiaries: pd.DataFrame,
+) -> pd.DataFrame:
+    """Сопоставляет убытки с группами по номеру убытка из Excel.
+
+    Args:
+        facts: таблица фактов (колонка ``LossNumber`` уже нормализована).
+        beneficiaries: участники с колонкой ``loss_number`` (prod-парсер).
+
+    Returns:
+        Таблица ``LossNumber``, ``group_id``, ``matched_members`` (1 на пару).
+    """
+    if beneficiaries.empty or "loss_number" not in beneficiaries.columns:
+        return pd.DataFrame(columns=[LOSS_KEY, "group_id", "matched_members"])
+
+    mapping = beneficiaries.loc[:, ["loss_number", "group_id"]].copy()
+    mapping["loss_number"] = normalize_series(mapping["loss_number"])
+    mapping = mapping.loc[mapping["loss_number"].astype(bool)]
+    mapping = mapping.drop_duplicates(subset=["loss_number", "group_id"])
+    if mapping.empty:
+        return pd.DataFrame(columns=[LOSS_KEY, "group_id", "matched_members"])
+
+    mapping = mapping.rename(columns={"loss_number": LOSS_KEY})
+    membership = facts.loc[:, [LOSS_KEY]].drop_duplicates().merge(
+        mapping, on=LOSS_KEY, how="inner"
+    )
+    membership["matched_members"] = 1
+    return membership.loc[:, [LOSS_KEY, "group_id", "matched_members"]]
+
+
 def attach_groups_to_losses(
     facts: pd.DataFrame,
     beneficiaries: pd.DataFrame,
     *,
     min_members_matched: int = 1,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Сопоставляет убытки с группами сервиса по участникам.
+    """Сопоставляет убытки с группами сервиса по участникам и/или номеру убытка.
 
     Args:
         facts: таблица фактов по убыткам (см. :func:`collapse_losses_to_facts`).
         beneficiaries: таблица участников.
         min_members_matched: сколько участников группы должно встречаться в
-            убытке, чтобы убыток считался «групповым».
+            убытке, чтобы убыток считался «групповым» (для матча по person_key).
 
     Returns:
         Кортеж:
@@ -262,47 +293,70 @@ def attach_groups_to_losses(
           ``group_id``, ``matched_members`` (одна строка на пару убыток-группа).
 
     Note:
-        В исходной тетради использовалось ``Series.map`` со словарём
-        «ФИО+ДР -> номер группы», то есть каждый убыток привязывался максимум к
-        одной группе, и принадлежность терялась при любом расхождении
-        написания. Здесь — обычный inner join по ``person_key``, который
-        естественно поддерживает убыток в нескольких группах.
+        Prod-выгрузки содержат ``loss_number`` — прямой матч с ``LossNumber``.
+        Параллельно остаётся join по ``person_key``. Результаты объединяются
+        (union), дубликаты пар ``LossNumber``+``group_id`` схлопываются.
     """
-    keys = [column for column in BENEFICIARY_KEY_COLUMNS if column in facts.columns]
-    if not keys or beneficiaries.empty:
+    if beneficiaries.empty or facts.empty:
         return _empty_pairs(facts), _empty_pairs(facts)
 
-    lookup = build_beneficiary_lookup(beneficiaries)
+    membership_parts: list[pd.DataFrame] = []
 
-    # melt вместо цикла по колонкам + concat — один проход, меньше копий.
-    id_vars = [LOSS_KEY, GROSS_LOSS, NET_LOSS, LOSS_YEAR]
-    long_frame = (
-        facts.loc[:, id_vars + keys]
-        .melt(id_vars=id_vars, value_vars=keys, value_name="person_key")
-        .drop(columns=["variable"])
+    by_loss = attach_groups_by_loss_number(facts, beneficiaries)
+    if not by_loss.empty:
+        membership_parts.append(by_loss)
+
+    keys = [column for column in BENEFICIARY_KEY_COLUMNS if column in facts.columns]
+    has_person = (
+        "person_key" in beneficiaries.columns
+        and beneficiaries["person_key"].astype(bool).any()
     )
-    long_frame = long_frame.loc[long_frame["person_key"].astype(bool)]
-    long_frame = long_frame.drop_duplicates(subset=[LOSS_KEY, "person_key"])
+    if keys and has_person:
+        lookup = build_beneficiary_lookup(
+            beneficiaries.loc[beneficiaries["person_key"].astype(bool)]
+        )
+        if not lookup.empty:
+            id_vars = [LOSS_KEY, GROSS_LOSS, NET_LOSS, LOSS_YEAR]
+            available_id = [column for column in id_vars if column in facts.columns]
+            long_frame = (
+                facts.loc[:, available_id + keys]
+                .melt(id_vars=available_id, value_vars=keys, value_name="person_key")
+                .drop(columns=["variable"])
+            )
+            long_frame = long_frame.loc[long_frame["person_key"].astype(bool)]
+            long_frame = long_frame.drop_duplicates(subset=[LOSS_KEY, "person_key"])
+            if not long_frame.empty:
+                merged = long_frame.merge(lookup, on="person_key", how="inner")
+                by_person = (
+                    merged.groupby([LOSS_KEY, "group_id"], as_index=False)
+                    .agg(
+                        matched_members=("person_key", "nunique"),
+                        members=("members", "max"),
+                    )
+                    .loc[lambda frame: frame["matched_members"] >= min_members_matched]
+                    .drop(columns=["members"])
+                )
+                if not by_person.empty:
+                    membership_parts.append(by_person)
 
-    if long_frame.empty:
-        empty = facts.assign(group_id=pd.NA, matched_members=0)
-        return empty.iloc[0:0], empty
+    if not membership_parts:
+        return _empty_pairs(facts), _empty_pairs(facts)
 
-    merged = long_frame.merge(lookup, on="person_key", how="inner")
-
+    membership = pd.concat(membership_parts, ignore_index=True)
     membership = (
-        merged.groupby([LOSS_KEY, "group_id"], as_index=False)
-        .agg(matched_members=("person_key", "nunique"), members=("members", "max"))
-        .loc[lambda frame: frame["matched_members"] >= min_members_matched]
+        membership.groupby([LOSS_KEY, "group_id"], as_index=False)
+        .agg(matched_members=("matched_members", "max"))
     )
-    membership = membership.drop(columns=["members"])
 
     facts_with_groups = facts.merge(membership, on=LOSS_KEY, how="inner")
     LOGGER.info(
-        "Убытков сопоставлено с группами: %d из %d (пар убыток-группа: %d)",
+        "Убытков сопоставлено с группами: %d из %d (пар убыток-группа: %d; "
+        "по номеру: %d, по person_key: %d)",
         facts_with_groups[LOSS_KEY].nunique(),
         facts[LOSS_KEY].nunique(),
         len(facts_with_groups),
+        len(by_loss) if not by_loss.empty else 0,
+        len(membership) - (len(by_loss) if not by_loss.empty else 0),
     )
     return membership, facts_with_groups
 

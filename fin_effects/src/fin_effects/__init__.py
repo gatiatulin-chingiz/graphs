@@ -7,7 +7,9 @@
 ``io_utils``
     Чтение/запись промежуточных артефактов (pkl, parquet, xlsx).
 ``excel_beneficiaries``
-    Загрузка выгрузок сервиса (xlsx-файлы с участниками групп).
+    Загрузка выгрузок сервиса (xlsx): prod-формат «Убыток»+цвет и legacy 3 колонки.
+``excel_loss_groups``
+    Prod-парсер широких Excel (openpyxl, цвет строк, пары ФИО+ДР).
 ``queries``
     SQL-запросы к OISUU (Losses / Payments / Cards).
 ``loaders``

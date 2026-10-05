@@ -2,6 +2,10 @@
 
 ## 2026-10-05
 
+- Что: prod-парсер Excel (`excel_loss_groups`): листы с колонкой «Убыток» (нормализация заголовков), цветные строки (заливка/шрифт), 1 файл = 1 группа; матч убытков по `loss_number` + `person_key`.
+- Зачем: боевые выгрузки — широкие таблицы убытков, а не 3 колонки ФИО/ДР; старый парсер почти ничего не матчил.
+- Проверка: `pytest tests/test_excel_loss_groups.py`; на сервере `SYNTHETIC=False` — рост «Пар убыток-группа».
+
 - Что: в `legacy_detection_and_relevance` `LossNumber` нормализуется до merge с карточками.
 - Зачем: из SQL ключ приходит как `float64`, после `normalize_series` у карточек — `object`, pandas падал на merge.
 - Проверка: ячейка legacy-сравнения при `SYNTHETIC = False`.
