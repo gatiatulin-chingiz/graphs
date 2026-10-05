@@ -2,6 +2,10 @@
 
 ## 2026-10-05
 
+- Что: в `legacy_detection_and_relevance` `LossNumber` нормализуется до merge с карточками.
+- Зачем: из SQL ключ приходит как `float64`, после `normalize_series` у карточек — `object`, pandas падал на merge.
+- Проверка: ячейка legacy-сравнения при `SYNTHETIC = False`.
+
 - Что: из `LOSSES_QUERY` убран JOIN к `oisuu81_t_IncidentCharacteristics` / колонка `IncidentNumber`.
 - Зачем: на текущем OISUU объекта нет (`Invalid object name`), а в пайплайне эффекта `IncidentNumber` не используется.
 - Проверка: `load_losses_from_db()` при `SYNTHETIC = False`.

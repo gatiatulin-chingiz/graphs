@@ -223,6 +223,7 @@ def legacy_detection_and_relevance(
         (2024) — ровно как в тетради, независимо от данных карточек.
     """
     frame = losses_.copy()
+    frame[LOSS_KEY] = normalize_series(frame[LOSS_KEY])
     frame[LOSS_DATE] = pd.to_datetime(frame[LOSS_DATE], errors="coerce")
     frame[LOSS_YEAR] = frame[LOSS_DATE].dt.year
 
