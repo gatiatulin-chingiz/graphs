@@ -346,7 +346,7 @@ money_display"""
     {
         0: BENEFICIARIES["full_name"].tolist(),
         1: BENEFICIARIES["birth_date"].astype(str).tolist(),
-        2: BENEFICIARIES["group_number"].astype(str).tolist(),
+        2: BENEFICIARIES["group_id"].astype(str).tolist(),
     }
 )
 legacy_table = legacy_pipeline_summary(LOSSES, raw_beneficiaries, CARDS)

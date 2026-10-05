@@ -2,6 +2,10 @@
 
 ## 2026-10-05
 
+- Что: в legacy-сравнении ноутбука колонка группы берётся как `group_id` (а не `group_number`).
+- Зачем: в продовом Excel после `load_beneficiaries` есть только `group_id`; `group_number` есть лишь у синтетики.
+- Проверка: ячейка «исходная логика против исправленной» при `SYNTHETIC = False`.
+
 - Что: добавлен `env_template`; `DbConfig` читает `.env`; ODBC для OISUU перебирает `.so` на диске и `pyodbc.drivers()` (как в monitoring: Driver 18 / `libmsodbcsql-18.so`).
 - Зачем: на Jupyter нет Driver 17, из‑за этого падал `load_losses_from_db`.
 - Проверка: `cp env_template .env`, заполнить UID/PWD, при необходимости `OISUU_ODBC_DRIVER=/usr/lib64/libmsodbcsql-18.so`, restart kernel, `SYNTHETIC = False`.
