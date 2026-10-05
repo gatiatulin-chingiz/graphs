@@ -308,33 +308,44 @@ def _theme_or_rgb(color: Any) -> str | None:
 
 
 def cell_has_color(cell: Cell) -> bool:
-    """Есть ли у ячейки значимая заливка или цвет шрифта."""
+    """Есть ли у ячейки значимая заливка или цвет шрифта (быстрый путь)."""
     fill = cell.fill
-    if fill is not None and fill.fill_type not in (None, "none"):
+    pattern = getattr(fill, "patternType", None) if fill is not None else None
+    if pattern not in (None, "none"):
+        # Любая видимая заливка (жёлтая/зелёная и т.п.); белый/почти белый отсекаем дёшево
         fg = getattr(fill, "fgColor", None) or getattr(fill, "start_color", None)
-        bg = getattr(fill, "bgColor", None) or getattr(fill, "end_color", None)
-        for color in (fg, bg):
-            rgb = _theme_or_rgb(color)
-            if rgb and rgb not in _DEFAULT_FONT_RGB:
-                # Белый/почти прозрачный часто = «нет заливки»
-                if rgb.endswith("FFFFFF") or rgb in {"FFFFFFFF", "00FFFFFF"}:
-                    continue
-                return True
+        rgb = _theme_or_rgb(fg) if fg is not None else None
+        if rgb is None or not (rgb.endswith("FFFFFF") or rgb in {"FFFFFFFF", "00FFFFFF"}):
+            return True
 
     font = cell.font
-    if font is not None and font.color is not None:
-        rgb = _theme_or_rgb(font.color)
-        if rgb and rgb not in _DEFAULT_FONT_RGB and not rgb.endswith("000000"):
-            return True
-    return False
+    if font is None or font.color is None:
+        return False
+    color = font.color
+    if color.type is None:
+        return False
+    if color.type == "theme" and color.theme in (0, 1) and not color.tint:
+        return False
+    if color.type == "indexed" and color.indexed in (0, 1, 64, 65):
+        return False
+    if color.type == "rgb" and color.rgb:
+        rgb = str(color.rgb).upper()
+        if rgb in _DEFAULT_FONT_RGB or rgb.endswith("000000"):
+            return False
+        return True
+    return color.type in {"theme", "indexed"}
+
+
+def row_cells_have_color(cells: Sequence[Cell]) -> bool:
+    """Есть ли в строке хотя бы одна окрашенная ячейка."""
+    return any(cell_has_color(cell) for cell in cells)
 
 
 def row_has_color(worksheet: Worksheet, row: int, max_col: int) -> bool:
     """Есть ли в строке хотя бы одна окрашенная ячейка."""
-    for col in range(1, max_col + 1):
-        if cell_has_color(worksheet.cell(row=row, column=col)):
-            return True
-    return False
+    return row_cells_have_color(
+        [worksheet.cell(row=row, column=col) for col in range(1, max_col + 1)]
+    )
 
 
 def _cell_value(cell: Cell) -> object:
@@ -372,8 +383,8 @@ def find_header_row(
     if max_row < 1 or max_col < 1:
         return None
 
-    for row in range(1, max_row + 1):
-        raw = [_cell_value(worksheet.cell(row=row, column=col)) for col in range(1, max_col + 1)]
+    for row_cells in worksheet.iter_rows(min_row=1, max_row=max_row, max_col=max_col):
+        raw = [cell.value for cell in row_cells]
         headers = [normalize_header(value) for value in raw]
         if not _header_has_ubytok(headers):
             continue
@@ -381,7 +392,8 @@ def find_header_row(
             # Лист только с «Убыток» без ФИО всё равно полезен (матч по номеру)
             if not any(_is_loss_number_header(h) for h in headers):
                 continue
-        return row, headers, raw
+        row_index = row_cells[0].row if row_cells else 1
+        return row_index, headers, raw
     return None
 
 
@@ -395,6 +407,10 @@ def find_loss_column(headers: Sequence[str]) -> int | None:
         if header.startswith("убыток"):
             return idx
     return None
+
+
+#: Сколько пустых некрашенных строк подряд — стоп (раздутый max_row в Excel).
+EMPTY_STREAK_STOP = 80
 
 
 def parse_prod_sheet(
@@ -430,12 +446,26 @@ def parse_prod_sheet(
     records: list[dict[str, object]] = []
     colored = 0
     loss_numbers_seen: set[str] = set()
+    empty_streak = 0
 
-    for row in range(header_row + 1, max_row + 1):
-        if not row_has_color(worksheet, row, max_col):
+    for row_cells in worksheet.iter_rows(
+        min_row=header_row + 1,
+        max_row=max_row,
+        max_col=max_col,
+    ):
+        row_index = row_cells[0].row if row_cells else header_row + 1
+        if not row_cells_have_color(row_cells):
+            if all(cell.value is None or str(cell.value).strip() == "" for cell in row_cells):
+                empty_streak += 1
+                if empty_streak >= EMPTY_STREAK_STOP:
+                    break
+            else:
+                empty_streak = 0
             continue
+
+        empty_streak = 0
         colored += 1
-        values = [_cell_value(worksheet.cell(row=row, column=col)) for col in range(1, max_col + 1)]
+        values = [cell.value for cell in row_cells]
         loss_number = _normalize_loss_number(values[loss_col] if loss_col < len(values) else None)
         if loss_number:
             loss_numbers_seen.add(loss_number)
@@ -471,11 +501,10 @@ def parse_prod_sheet(
                         "loss_number": loss_number,
                         "source_file": source_file,
                         "source_sheet": source_sheet,
-                        "row_index": row,
+                        "row_index": row_index,
                     }
                 )
         elif loss_number:
-            # Только номер убытка — для матча по LossNumber
             records.append(
                 {
                     "full_name": "",
@@ -485,7 +514,7 @@ def parse_prod_sheet(
                     "loss_number": loss_number,
                     "source_file": source_file,
                     "source_sheet": source_sheet,
-                    "row_index": row,
+                    "row_index": row_index,
                 }
             )
 
@@ -523,7 +552,7 @@ def read_prod_workbook(path: str | Path) -> tuple[pd.DataFrame, ProdSheetStats]:
     total = ProdSheetStats()
 
     try:
-        workbook = load_workbook(path, read_only=False, data_only=True)
+        workbook = load_workbook(path, read_only=False, data_only=True, keep_links=False)
     except Exception as error:  # noqa: BLE001
         LOGGER.error("Не удалось открыть prod-xlsx %s: %s", path.name, error)
         return _empty_frame(), total

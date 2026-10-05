@@ -16,7 +16,7 @@ from typing import Any
 import pandas as pd
 
 from . import queries
-from .config import DbConfig, load_dotenv
+from .config import ARTIFACT_CARDS, ARTIFACT_LOSSES, DbConfig, load_dotenv
 from .io_utils import read_pickle, write_pickle
 
 LOGGER = logging.getLogger(__name__)
@@ -209,6 +209,65 @@ def load_cards_from_db(db_config: DbConfig | None = None) -> pd.DataFrame:
         Таблица карточек УПС.
     """
     return read_sql(queries.CARDS_QUERY, db_config, database="oisuu81")
+
+
+def _write_parquet_cache(frame: pd.DataFrame, path: Path) -> Path:
+    """Пишет DataFrame в parquet, создавая каталог."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    frame.to_parquet(path, index=False)
+    LOGGER.info("Кэш сохранён: %s (%d строк)", path, len(frame))
+    return path
+
+
+def load_losses(
+    db_config: DbConfig | None = None,
+    *,
+    cache_path: str | Path | None = None,
+    refresh: bool = False,
+) -> pd.DataFrame:
+    """Убытки из parquet-кэша или из SQL (с сохранением в кэш).
+
+    Args:
+        db_config: параметры подключения (только при SQL).
+        cache_path: путь к parquet; по умолчанию ``data/interim/losses.parquet``.
+        refresh: ``True`` — игнорировать кэш и перечитать SQL.
+
+    Returns:
+        Таблица убытков.
+    """
+    path = Path(cache_path) if cache_path is not None else ARTIFACT_LOSSES
+    if path.exists() and not refresh:
+        LOGGER.info("Убытки из кэша: %s", path)
+        return pd.read_parquet(path)
+    frame = load_losses_from_db(db_config)
+    _write_parquet_cache(frame, path)
+    return frame
+
+
+def load_cards(
+    db_config: DbConfig | None = None,
+    *,
+    cache_path: str | Path | None = None,
+    refresh: bool = False,
+) -> pd.DataFrame:
+    """Карточки УПС из parquet-кэша или из SQL (с сохранением в кэш).
+
+    Args:
+        db_config: параметры подключения (только при SQL).
+        cache_path: путь к parquet; по умолчанию ``data/interim/cards.parquet``.
+        refresh: ``True`` — игнорировать кэш и перечитать SQL.
+
+    Returns:
+        Таблица карточек УПС.
+    """
+    path = Path(cache_path) if cache_path is not None else ARTIFACT_CARDS
+    if path.exists() and not refresh:
+        LOGGER.info("Карточки УПС из кэша: %s", path)
+        return pd.read_parquet(path)
+    frame = load_cards_from_db(db_config)
+    _write_parquet_cache(frame, path)
+    return frame
 
 
 def read_table(path: str | Path) -> pd.DataFrame:

@@ -263,11 +263,74 @@ def sensitivity_table(
     return pd.DataFrame(rows)
 
 
-def headcount_table(summary: pd.DataFrame) -> pd.DataFrame:
+def pipeline_overview_table(result: PipelineResult) -> pd.DataFrame:
+    """Краткие KPI прогона для ноутбука и отчёта.
+
+    Args:
+        result: результат :func:`~fin_effects.pipeline.run_pipeline`.
+
+    Returns:
+        Таблица «показатель — значение».
+    """
+    groups_in = (
+        int(result.beneficiaries["group_id"].nunique())
+        if "group_id" in result.beneficiaries.columns
+        else 0
+    )
+    unique_matched = (
+        int(result.facts_with_groups["LossNumber"].nunique())
+        if not result.facts_with_groups.empty
+        else 0
+    )
+    kpis = summary_kpis(result.group_effect, result.params)
+    stats = result.effect_stats
+    return pd.DataFrame(
+        [
+            {"Показатель": "Групп в выгрузке сервиса", "Значение": groups_in},
+            {"Показатель": "Групп в расчёте (после порогов)", "Значение": len(result.summary)},
+            {
+                "Показатель": "Убытков в периоде (факты, уник.)",
+                "Значение": len(result.loss_facts),
+            },
+            {
+                "Показатель": "Убытков привязано к группам (уник.)",
+                "Значение": unique_matched,
+            },
+            {"Показатель": "Пар «убыток–группа»", "Значение": len(result.facts_with_groups)},
+            {"Показатель": "Групп: в работе", "Значение": stats.groups_in_progress},
+            {
+                "Показатель": "Групп: закрыта",
+                "Значение": stats.groups_closed,
+            },
+            {
+                "Показатель": "Групп без карточки УПС (вне эффекта)",
+                "Значение": result.group_stats.groups_without_card,
+            },
+            {
+                "Показатель": "Убыток групп за период, млн ₽",
+                "Значение": round(kpis["net_loss_total"] / 1e6, 1),
+            },
+            {
+                "Показатель": "Предотвращённый убыток (база), млн ₽",
+                "Значение": round(kpis["prevented_total"] / 1e6, 1),
+            },
+            {
+                "Показатель": f"Эффект сервиса (доля {result.params.service_share:.0%}), млн ₽",
+                "Значение": round(kpis["effect_total"] / 1e6, 1),
+            },
+        ]
+    )
+
+
+def headcount_table(
+    summary: pd.DataFrame,
+    facts_with_groups: pd.DataFrame | None = None,
+) -> pd.DataFrame:
     """Сводка по классам релевантности: сколько групп и какие годы.
 
     Args:
         summary: сводка по группам.
+        facts_with_groups: пары «убыток–группа» — для уникальных убытков по классу.
 
     Returns:
         Таблица «класс, групп, убытков, медиана лет жизни».
@@ -279,7 +342,7 @@ def headcount_table(summary: pd.DataFrame) -> pd.DataFrame:
         summary.groupby("group_relevance", as_index=False)
         .agg(
             groups=("group_id", "nunique"),
-            losses=("losses_total", "sum"),
+            losses_in_groups=("losses_total", "sum"),
             median_lifetime=("lifetime_years", "median"),
             mean_active_years=("active_years_count", "mean"),
             net_loss=("net_loss_total", "sum"),
@@ -288,7 +351,7 @@ def headcount_table(summary: pd.DataFrame) -> pd.DataFrame:
             columns={
                 "group_relevance": "Класс",
                 "groups": "Групп",
-                "losses": "Убытков",
+                "losses_in_groups": "Убытков (Σ по группам)",
                 "median_lifetime": "Медиана лет жизни",
                 "mean_active_years": "Активных лет (среднее)",
                 "net_loss": "Убыток, млн ₽",
@@ -296,6 +359,20 @@ def headcount_table(summary: pd.DataFrame) -> pd.DataFrame:
         )
         .sort_values("Групп", ascending=False)
     )
+    if facts_with_groups is not None and not facts_with_groups.empty:
+        merged = facts_with_groups.merge(
+            summary.loc[:, ["group_id", "group_relevance"]],
+            on="group_id",
+            how="inner",
+        )
+        unique = (
+            merged.groupby("group_relevance")["LossNumber"]
+            .nunique()
+            .rename("Убытков (уник.)")
+            .reset_index()
+            .rename(columns={"group_relevance": "Класс"})
+        )
+        grouped = grouped.merge(unique, on="Класс", how="left")
     grouped["Убыток, млн ₽"] = grouped["Убыток, млн ₽"] / 1_000_000
     return grouped.reset_index(drop=True)
 
@@ -678,8 +755,8 @@ def write_html_report(
         ),
         _figure_section("effect_by_year", "Эффект по годам — график"),
         (
-            "<section><h2>Чувствительность к доле сервиса</h2>"
-            f"{_df_to_html(sensitivity_table(result.group_effect, params))}</section>"
+            "<section><h2>Сводка прогона</h2>"
+            f"{_df_to_html(pipeline_overview_table(result))}</section>"
         ),
         _figure_section("relevance_split", "Распределение групп по классам"),
         _figure_section("baseline_distribution", "Распределение базы эффекта"),

@@ -46,10 +46,10 @@ import pandas as pd
 
 from .config import (
     DEFAULT_PARAMS,
-    RELEVANCE_ALIVE,
-    RELEVANCE_DIED_AFTER,
-    RELEVANCE_DIED_BEFORE,
+    RELEVANCE_CLOSED,
+    RELEVANCE_IN_PROGRESS,
     RELEVANCE_LABELS,
+    RELEVANT_CLASSES,
     EffectParams,
 )
 from .preprocess import GROUP_KEY, LOSS_KEY, LOSS_YEAR, NET_LOSS
@@ -76,21 +76,16 @@ class EffectStats:
     """Статистика расчёта эффекта."""
 
     groups_total: int = 0
-    groups_alive: int = 0
-    groups_died_after: int = 0
-    groups_died_before: int = 0
+    groups_in_progress: int = 0
+    groups_closed: int = 0
     groups_no_baseline: int = 0
 
     def as_text(self) -> str:
-        """Человекочитаемая сводка.
-
-        Returns:
-            Строка для логов ноутбука.
-        """
+        """Человекочитаемая сводка."""
         return (
             f"групп: {self.groups_total} "
-            f"(действуют {self.groups_alive}, распались после {self.groups_died_after}, "
-            f"распались заранее {self.groups_died_before}, без базы {self.groups_no_baseline})"
+            f"(в работе {self.groups_in_progress}, закрыта {self.groups_closed}, "
+            f"без базы {self.groups_no_baseline})"
         )
 
 
@@ -278,7 +273,7 @@ def compute_group_effect(
 
     frame["service_share"] = params.service_share
     frame["effect_first_year"] = np.where(
-        frame["group_relevance"].isin((RELEVANCE_ALIVE, RELEVANCE_DIED_AFTER)),
+        frame["group_relevance"].isin(RELEVANT_CLASSES),
         frame["mean_loss_per_active_year"] * params.service_share,
         0.0,
     )
@@ -286,14 +281,14 @@ def compute_group_effect(
     # effect_total расходится с матрицей/effect_long при detection близко к last_year.
     detection = pd.to_numeric(frame["detection_year"], errors="coerce")
     max_years = (params.last_year - detection + 1).clip(lower=0)
-    alive_years = np.minimum(params.project_years, max_years)
-    died_after_years = np.minimum(1, max_years)
+    in_progress_years = np.minimum(params.project_years, max_years)
+    closed_years = np.minimum(1, max_years)
     frame["effect_total"] = np.where(
-        frame["group_relevance"] == RELEVANCE_ALIVE,
-        frame["effect_first_year"] * alive_years,
+        frame["group_relevance"] == RELEVANCE_IN_PROGRESS,
+        frame["effect_first_year"] * in_progress_years,
         np.where(
-            frame["group_relevance"] == RELEVANCE_DIED_AFTER,
-            frame["effect_first_year"] * died_after_years,
+            frame["group_relevance"] == RELEVANCE_CLOSED,
+            frame["effect_first_year"] * closed_years,
             0.0,
         ),
     )
@@ -301,9 +296,8 @@ def compute_group_effect(
 
     stats = EffectStats(
         groups_total=len(frame),
-        groups_alive=int((frame["group_relevance"] == RELEVANCE_ALIVE).sum()),
-        groups_died_after=int((frame["group_relevance"] == RELEVANCE_DIED_AFTER).sum()),
-        groups_died_before=int((frame["group_relevance"] == RELEVANCE_DIED_BEFORE).sum()),
+        groups_in_progress=int((frame["group_relevance"] == RELEVANCE_IN_PROGRESS).sum()),
+        groups_closed=int((frame["group_relevance"] == RELEVANCE_CLOSED).sum()),
         groups_no_baseline=no_baseline,
     )
     LOGGER.info("Расчёт эффекта по группам: %s", stats.as_text())
@@ -338,8 +332,11 @@ def effect_matrix(
     rows: list[dict[str, object]] = []
     for record in group_effect.itertuples(index=False):
         detection_year = int(record.detection_year)
-        is_alive = record.group_relevance == RELEVANCE_ALIVE
-        years = range(detection_year, detection_year + (params.project_years if is_alive else 1))
+        is_in_progress = record.group_relevance == RELEVANCE_IN_PROGRESS
+        years = range(
+            detection_year,
+            detection_year + (params.project_years if is_in_progress else 1),
+        )
         for year in years:
             if year > params.last_year:
                 continue
@@ -386,7 +383,9 @@ def effect_long(
     rows: list[dict[str, object]] = []
     for record in group_effect.itertuples(index=False):
         detection_year = int(record.detection_year)
-        years_count = params.project_years if record.group_relevance == RELEVANCE_ALIVE else 1
+        years_count = (
+            params.project_years if record.group_relevance == RELEVANCE_IN_PROGRESS else 1
+        )
         for offset in range(years_count):
             year = detection_year + offset
             if year > params.last_year:
@@ -459,16 +458,15 @@ def effect_by_cohort(
         .astype(int)
         .rename(
             columns={
-                RELEVANCE_ALIVE: "groups_alive",
-                RELEVANCE_DIED_AFTER: "groups_died_after",
-                RELEVANCE_DIED_BEFORE: "groups_died_before",
+                RELEVANCE_IN_PROGRESS: "groups_in_progress",
+                RELEVANCE_CLOSED: "groups_closed",
             }
         )
         .reset_index()
     )
 
     relevant = group_effect.loc[
-        group_effect["group_relevance"].isin((RELEVANCE_ALIVE, RELEVANCE_DIED_AFTER))
+        group_effect["group_relevance"].isin(RELEVANT_CLASSES)
     ]
     year_of_detection = (
         relevant.groupby("detection_year", as_index=False)
@@ -489,7 +487,7 @@ def effect_by_cohort(
     cohort = cohort.merge(class_counts, on="detection_year", how="left")
     cohort = cohort.merge(projected, on="detection_year", how="left")
     cohort = cohort.merge(year_of_detection, on="detection_year", how="left")
-    for column in ("groups_alive", "groups_died_after", "groups_died_before"):
+    for column in ("groups_in_progress", "groups_closed"):
         cohort[column] = cohort[column].fillna(0).astype(int)
     cohort["effect_projected"] = cohort["effect_projected"].fillna(0.0)
     cohort["effect_year_of_detection"] = cohort["effect_year_of_detection"].fillna(0.0)

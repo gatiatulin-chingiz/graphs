@@ -39,9 +39,8 @@ import pandas as pd
 
 from .config import (
     PERSON_DATE_PAIRS,
-    RELEVANCE_ALIVE,
-    RELEVANCE_DIED_AFTER,
-    RELEVANCE_DIED_BEFORE,
+    RELEVANCE_CLOSED,
+    RELEVANCE_IN_PROGRESS,
     SYNTH_DIR,
 )
 from .io_utils import write_pickle
@@ -114,6 +113,8 @@ class SynthConfig:
         payout_range: диапазон выплаты по убытку, ₽.
         recovery_probability: вероятность взыскания по убытку.
         output_dir: каталог вывода.
+        write_workbooks: писать xlsx групп (медленно); ``False`` — только таблицы
+            в памяти (достаточно для пайплайна/отчёта).
         scenarios: распределение сценариев (имя -> вес).
     """
 
@@ -130,6 +131,7 @@ class SynthConfig:
     payout_range: tuple[int, int] = (45_000, 480_000)
     recovery_probability: float = 0.18
     output_dir: Path = field(default_factory=lambda: SYNTH_DIR)
+    write_workbooks: bool = True
     scenarios: dict[str, float] = field(
         default_factory=lambda: {
             "alive": 0.45,
@@ -186,34 +188,27 @@ class GroupPlan:
     card_year: int | None
 
     @property
-    def observed_detection_year(self) -> int:
-        """Год обнаружения, который увидит пайплайн.
-
-        Returns:
-            Год карточки УПС, либо (при её отсутствии) год первого убытка.
-        """
+    def observed_detection_year(self) -> int | None:
+        """Год обнаружения по карточке УПС; ``None``, если карточки нет."""
         if self.has_card and self.card_year is not None:
             return int(self.card_year)
-        return int(min(self.loss_years))
+        return None
 
     @property
-    def expected_relevance(self) -> str:
-        """Ожидаемый класс релевантности — эталон для тестов.
+    def card_stage(self) -> str | None:
+        """Стадия карточки УПС для эталона классификации."""
+        if not self.has_card:
+            return None
+        # «в работе» — сценарии с продолжающейся жизнью группы; остальное — закрыта
+        if self.scenario in {"alive", "no_card"}:
+            # no_card не имеет стадии; alive — в работе
+            return RELEVANCE_IN_PROGRESS if self.scenario == "alive" else None
+        return RELEVANCE_CLOSED
 
-        Returns:
-            Один из :data:`~fin_effects.config.RELEVANCE_LABELS`.
-
-        Note:
-            Повторяет правила :func:`~fin_effects.groups.classify_group_relevance`,
-            но считается по «истинному» плану, а не по данным.
-        """
-        last_year = int(max(self.loss_years))
-        detection = self.observed_detection_year
-        if last_year > detection:
-            return RELEVANCE_ALIVE
-        if last_year == detection:
-            return RELEVANCE_DIED_AFTER
-        return RELEVANCE_DIED_BEFORE
+    @property
+    def expected_relevance(self) -> str | None:
+        """Ожидаемый статус по карточке УПС; ``None`` без карточки."""
+        return self.card_stage
 
 
 @dataclass
@@ -673,6 +668,7 @@ def generate_synthetic_data(config: SynthConfig | None = None) -> SynthResult:
 
         if plan.has_card and group_loss_numbers and plan.card_year is not None:
             detection_date = pd.Timestamp(year=int(plan.card_year), month=3, day=15)
+            stage = "В работе" if plan.card_stage == RELEVANCE_IN_PROGRESS else "Закрыта"
             cards.append(
                 {
                     "Номер карточки УПС": f"UPS-{plan.group_number:06d}",
@@ -680,7 +676,7 @@ def generate_synthetic_data(config: SynthConfig | None = None) -> SynthResult:
                     "Дата создания карточки": detection_date,
                     "Дата закрытия карточки (дата заключения)": detection_date
                     + pd.Timedelta(days=rng.randint(10, 90)),
-                    "Стадия": rng.choice(["Закрыта", "В работе"]),
+                    "Стадия": stage,
                     "Финансовый результат": rng.choice(["Мошенничество", "Отказ"]),
                     "Финансовый результат (денежный)": 0.0,
                     "Предотвращенный ущерб": 0.0,
@@ -729,7 +725,9 @@ def generate_synthetic_data(config: SynthConfig | None = None) -> SynthResult:
     write_pickle(beneficiaries, raw_dir / "beneficiaries.pkl")
     groups_frame.to_csv(config.output_dir / "groups_truth.csv", index=False)
 
-    files = generate_beneficiary_workbooks(config, plans)
+    files: list[Path] = []
+    if config.write_workbooks:
+        files = generate_beneficiary_workbooks(config, plans)
 
     result = SynthResult(
         beneficiaries=beneficiaries,

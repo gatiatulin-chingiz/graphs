@@ -60,6 +60,7 @@ def main() -> int:
         groups=args.groups,
         noise_losses=args.noise,
         year_range=(args.first_year, args.last_year),
+        write_workbooks=False,
     )
 
     started = time.perf_counter()

@@ -22,15 +22,15 @@ import numpy as np
 import pandas as pd
 
 from .config import (
+    BENEFICIARY_KEY_COLUMNS,
     DEFAULT_PARAMS,
-    RELEVANCE_ALIVE,
-    RELEVANCE_DIED_AFTER,
-    RELEVANCE_DIED_BEFORE,
+    RELEVANCE_CLOSED,
+    RELEVANCE_IN_PROGRESS,
     RELEVANCE_LABELS,
     EffectParams,
 )
 from .preprocess import LOSS_KEY, LOSS_YEAR, NET_LOSS
-from .textnorm import normalize_series
+from .textnorm import normalize_series, normalize_text
 
 LOGGER = logging.getLogger(__name__)
 
@@ -39,6 +39,8 @@ GROUP_ID = "group_id"
 
 #: Колонки таблицы карточек УПС -> внутренние имена.
 CARD_DATE_COLUMN = "Дата создания карточки"
+CARD_STAGE_COLUMN = "Стадия"
+CARD_LOSS_COLUMN = "Номер Убытка"
 
 #: Колонки сводки по группе.
 GROUP_SUMMARY_COLUMNS = (
@@ -46,6 +48,7 @@ GROUP_SUMMARY_COLUMNS = (
     "detection_year",
     "detection_date",
     "detection_source",
+    "card_stage",
     "first_loss_year",
     "last_loss_year",
     "lifetime_years",
@@ -88,30 +91,183 @@ def loss_detection_dates(cards: pd.DataFrame) -> pd.DataFrame:
         cards: таблица карточек УПС (колонки «Номер Убытка», «Дата создания карточки»).
 
     Returns:
-        Таблица ``LossNumber``, ``card_date`` — по одной строке на убыток.
+        Таблица ``LossNumber``, ``card_date`` [, ``card_stage``] — по одной строке на убыток.
 
     Raises:
         KeyError: если в таблице карточек нет обязательных колонок.
     """
-    required = {"Номер Убытка", CARD_DATE_COLUMN}
+    required = {CARD_LOSS_COLUMN, CARD_DATE_COLUMN}
     missing = required - set(cards.columns)
     if missing:
         raise KeyError(f"В таблице карточек нет колонок: {sorted(missing)}")
 
-    working = cards.loc[:, ["Номер Убытка", CARD_DATE_COLUMN]].copy()
-    working.columns = [LOSS_KEY, "card_date"]
-    working["card_date"] = pd.to_datetime(working["card_date"], errors="coerce")
-    # Номер убытка нормализуется так же, как в таблице фактов (регистр + пробелы),
-    # иначе JOIN по LossNumber не находит ни одной карточки.
-    working[LOSS_KEY] = normalize_series(working[LOSS_KEY])
+    columns = [CARD_LOSS_COLUMN, CARD_DATE_COLUMN]
+    rename = {CARD_LOSS_COLUMN: LOSS_KEY, CARD_DATE_COLUMN: "card_date"}
+    if CARD_STAGE_COLUMN in cards.columns:
+        columns.append(CARD_STAGE_COLUMN)
+        rename[CARD_STAGE_COLUMN] = "card_stage_raw"
 
-    result = (
-        working.dropna(subset=["card_date"])
-        .groupby(LOSS_KEY, as_index=False)["card_date"]
-        .min()
+    working = cards.loc[:, columns].copy()
+    working = working.rename(columns=rename)
+    working["card_date"] = pd.to_datetime(working["card_date"], errors="coerce")
+    working[LOSS_KEY] = normalize_series(working[LOSS_KEY])
+    if "card_stage_raw" in working.columns:
+        working["card_stage"] = working["card_stage_raw"].map(normalize_card_stage)
+    else:
+        working["card_stage"] = pd.NA
+
+    working = working.dropna(subset=["card_date"])
+    working = working.loc[working[LOSS_KEY].astype(bool)]
+    if working.empty:
+        return pd.DataFrame(columns=[LOSS_KEY, "card_date", "card_stage"])
+
+    # На убыток — самая ранняя карточка; стадия — с приоритетом «в работе».
+    working = working.sort_values("card_date")
+    first = working.groupby(LOSS_KEY, as_index=False).agg(
+        card_date=("card_date", "min"),
+        card_stage=("card_stage", _prefer_stage),
     )
-    LOGGER.info("Карточки УПС: %d убытков с датой создания", len(result))
-    return result
+    LOGGER.info("Карточки УПС: %d убытков с датой создания", len(first))
+    return first
+
+
+def normalize_card_stage(value: object) -> str | None:
+    """Приводит стадию карточки УПС к одному из двух статусов группы.
+
+    Args:
+        value: сырое значение колонки «Стадия».
+
+    Returns:
+        :data:`~fin_effects.config.RELEVANCE_IN_PROGRESS`,
+        :data:`~fin_effects.config.RELEVANCE_CLOSED` или ``None``.
+    """
+    text = normalize_text(value)
+    if not text:
+        return None
+    if "закрыт" in text:
+        return RELEVANCE_CLOSED
+    if "работ" in text or "открыт" in text:
+        return RELEVANCE_IN_PROGRESS
+    return None
+
+
+def _prefer_stage(values: pd.Series) -> object:
+    """При нескольких карточках предпочитает «в работе» закрытой."""
+    stages = {normalize_card_stage(value) for value in values}
+    stages.discard(None)
+    if RELEVANCE_IN_PROGRESS in stages:
+        return RELEVANCE_IN_PROGRESS
+    if RELEVANCE_CLOSED in stages:
+        return RELEVANCE_CLOSED
+    return pd.NA
+
+
+def link_cards_to_groups(
+    cards: pd.DataFrame,
+    *,
+    facts_with_groups: pd.DataFrame | None = None,
+    loss_facts: pd.DataFrame | None = None,
+    beneficiaries: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    """Связывает карточки УПС с группами сервиса.
+
+    Карточка часто ссылается на **один** убыток группы. Группа помечается
+    как «в работе у УПС», если:
+
+    * номер убытка из карточки уже есть в парах «убыток–группа»; или
+    * из этого убытка извлекаются ФИО+ДР и матчятся с участниками Excel.
+
+    Args:
+        cards: выгрузка карточек УПС.
+        facts_with_groups: пары убыток–группа (Excel).
+        loss_facts: факты по убыткам с колонками ``_<ФИО>``.
+        beneficiaries: участники групп с ``person_key``.
+
+    Returns:
+        Таблица ``group_id``, ``detection_date``, ``card_stage``, ``detection_source``.
+    """
+    if cards is None or cards.empty:
+        return pd.DataFrame(
+            columns=[GROUP_ID, "detection_date", "card_stage", "detection_source"]
+        )
+
+    card_dates = loss_detection_dates(cards)
+    if card_dates.empty:
+        return pd.DataFrame(
+            columns=[GROUP_ID, "detection_date", "card_stage", "detection_source"]
+        )
+
+    parts: list[pd.DataFrame] = []
+
+    if facts_with_groups is not None and not facts_with_groups.empty:
+        by_loss = (
+            facts_with_groups.loc[:, [LOSS_KEY, GROUP_ID]]
+            .drop_duplicates()
+            .merge(card_dates, on=LOSS_KEY, how="inner")
+        )
+        if not by_loss.empty:
+            parts.append(
+                by_loss.loc[:, [GROUP_ID, "card_date", "card_stage"]].assign(
+                    detection_source="ups_card_loss"
+                )
+            )
+
+    if (
+        loss_facts is not None
+        and not loss_facts.empty
+        and beneficiaries is not None
+        and not beneficiaries.empty
+        and "person_key" in beneficiaries.columns
+    ):
+        key_cols = [column for column in BENEFICIARY_KEY_COLUMNS if column in loss_facts.columns]
+        if key_cols:
+            card_losses = card_dates.loc[:, [LOSS_KEY]].drop_duplicates()
+            people = (
+                loss_facts.loc[:, [LOSS_KEY, *key_cols]]
+                .merge(card_losses, on=LOSS_KEY, how="inner")
+                .melt(id_vars=[LOSS_KEY], value_vars=key_cols, value_name="person_key")
+                .drop(columns=["variable"])
+            )
+            people["person_key"] = normalize_series(people["person_key"])
+            people = people.loc[people["person_key"].astype(bool)].drop_duplicates()
+            lookup = beneficiaries.loc[:, ["person_key", GROUP_ID]].copy()
+            lookup["person_key"] = normalize_series(lookup["person_key"])
+            lookup = lookup.loc[lookup["person_key"].astype(bool)].drop_duplicates()
+            if not people.empty and not lookup.empty:
+                by_person = (
+                    people.merge(lookup, on="person_key", how="inner")
+                    .loc[:, [LOSS_KEY, GROUP_ID]]
+                    .drop_duplicates()
+                    .merge(card_dates, on=LOSS_KEY, how="inner")
+                )
+                if not by_person.empty:
+                    parts.append(
+                        by_person.loc[:, [GROUP_ID, "card_date", "card_stage"]].assign(
+                            detection_source="ups_card_person"
+                        )
+                    )
+
+    if not parts:
+        return pd.DataFrame(
+            columns=[GROUP_ID, "detection_date", "card_stage", "detection_source"]
+        )
+
+    linked = pd.concat(parts, ignore_index=True)
+    linked = linked.rename(columns={"card_date": "detection_date"})
+    aggregated = (
+        linked.sort_values("detection_date")
+        .groupby(GROUP_ID, as_index=False)
+        .agg(
+            detection_date=("detection_date", "min"),
+            card_stage=("card_stage", _prefer_stage),
+            detection_source=("detection_source", "first"),
+        )
+    )
+    LOGGER.info(
+        "Карточки УПС привязаны к %d группам (через убыток/ФИО)",
+        len(aggregated),
+    )
+    return aggregated
 
 
 def filter_observation_period(
@@ -149,33 +305,27 @@ def build_group_summary(
     facts_with_groups: pd.DataFrame,
     cards: pd.DataFrame | None = None,
     params: EffectParams = DEFAULT_PARAMS,
+    *,
+    loss_facts: pd.DataFrame | None = None,
+    beneficiaries: pd.DataFrame | None = None,
 ) -> tuple[pd.DataFrame, GroupBuildStats]:
-    """Строит сводку по группам: обнаружение, жизнь, активные годы.
+    """Строит сводку по группам: обнаружение по УПС, жизнь, активные годы.
 
     Args:
-        facts_with_groups: пары «убыток-группа» (см.
-            :func:`~fin_effects.preprocess.attach_groups_to_losses`).
-        cards: таблица карточек УПС (даты обнаружения). ``None`` — дата
-            обнаружения берётся по году первого убытка группы.
+        facts_with_groups: пары «убыток-группа».
+        cards: таблица карточек УПС. Без карточки группа в эффект не попадает.
         params: параметры методики.
+        loss_facts: факты убытков (для расширения карточки через ФИО+ДР).
+        beneficiaries: участники Excel (для матча ФИО+ДР).
 
     Returns:
-        Кортеж «сводка по группам, статистика».
-
-    Note:
-        ``detection_year`` — год первой карточки УПС по убыткам группы.
-        Если карточек нет, используется год первого убытка группы, и колонка
-        ``detection_source`` помечает это как ``fallback_first_loss`` — раньше
-        такие группы молча выпадали из расчёта (в тетради после merge с датами
-        карточек стоял фильтр ``detection_date.notnull()``).
+        Кортеж «сводка только по группам с карточкой УПС, статистика».
     """
     if facts_with_groups.empty:
         return pd.DataFrame(columns=GROUP_SUMMARY_COLUMNS), GroupBuildStats()
 
     working = facts_with_groups.copy()
-    working["_is_group_loss"] = working["group_id"].notna()
-
-    base = working.loc[working["_is_group_loss"]]
+    base = working.loc[working["group_id"].notna()]
     per_loss = (
         base.groupby([GROUP_ID, LOSS_KEY], as_index=False)
         .agg(
@@ -191,7 +341,6 @@ def build_group_summary(
         .agg(losses=("LossNumber", "nunique"), net_loss=("net_loss", "sum"))
         .sort_values([GROUP_ID, "loss_year"])
     )
-
     active_years = per_year.loc[per_year["losses"] >= params.min_losses_per_year].copy()
 
     summary = (
@@ -204,7 +353,6 @@ def build_group_summary(
             members_matched=("members_matched", "max"),
         )
     )
-
     active_agg = (
         active_years.groupby(GROUP_ID, as_index=False)
         .agg(
@@ -221,15 +369,27 @@ def build_group_summary(
     summary["active_years_count"] = summary["active_years_count"].fillna(0).astype(int)
     summary["lifetime_years"] = summary["last_loss_year"] - summary["first_loss_year"] + 1
 
-    detection = _detection_dates(per_loss, cards)
+    all_groups = int(summary[GROUP_ID].nunique())
+    detection = link_cards_to_groups(
+        cards if cards is not None else pd.DataFrame(),
+        facts_with_groups=facts_with_groups,
+        loss_facts=loss_facts,
+        beneficiaries=beneficiaries,
+    )
     summary = summary.merge(detection, on=GROUP_ID, how="left")
+    summary["detection_year"] = pd.to_datetime(
+        summary["detection_date"], errors="coerce"
+    ).dt.year.astype("Int64")
 
-    groups_without_card = int((summary["detection_source"] == "fallback_first_loss").sum())
+    has_card = summary["detection_date"].notna()
+    groups_without_card = int((~has_card).sum())
     if groups_without_card:
         LOGGER.warning(
-            "У %d групп нет карточек УПС — дата обнаружения взята по первому убытку",
+            "У %d из %d групп нет карточки УПС — в расчёт эффекта не входят",
             groups_without_card,
+            all_groups,
         )
+    summary = summary.loc[has_card].copy()
 
     summary = summary.loc[
         :, [column for column in GROUP_SUMMARY_COLUMNS if column in summary.columns]
@@ -245,104 +405,36 @@ def build_group_summary(
     return summary, stats
 
 
-def _detection_dates(per_loss: pd.DataFrame, cards: pd.DataFrame | None) -> pd.DataFrame:
-    """Определяет дату/год обнаружения для каждой группы.
+def classify_group_relevance(summary: pd.DataFrame) -> pd.DataFrame:
+    """Статус группы по стадии карточки УПС: «в работе» или «закрыта».
 
     Args:
-        per_loss: таблица «группа-убыток» с датами и потерями.
-        cards: таблица карточек УПС или ``None``.
+        summary: сводка с колонкой ``card_stage`` (см. :func:`build_group_summary`).
 
     Returns:
-        Таблица ``group_id``, ``detection_date``, ``detection_year``,
-        ``detection_source``.
-    """
-    if cards is not None and not cards.empty:
-        card_dates = loss_detection_dates(cards)
-        enriched = per_loss.merge(card_dates, on=LOSS_KEY, how="left")
-        detected = (
-            enriched.dropna(subset=["card_date"])
-            .groupby(GROUP_ID, as_index=False)
-            .agg(detection_date=("card_date", "min"))
-        )
-    else:
-        detected = pd.DataFrame(
-            {
-                GROUP_ID: pd.Series(dtype="object"),
-                "detection_date": pd.Series(dtype="datetime64[ns]"),
-            }
-        )
-
-    detected["detection_year"] = detected["detection_date"].dt.year.astype("Int64")
-    detected["detection_source"] = "ups_card"
-
-    fallback = (
-        per_loss.groupby(GROUP_ID, as_index=False)
-        .agg(first_loss_date=("loss_date", "min"), fallback_year=("loss_year", "min"))
-        .loc[:, [GROUP_ID, "first_loss_date", "fallback_year"]]
-    )
-    merged = fallback.merge(detected, on=GROUP_ID, how="left")
-    needs_fallback = merged["detection_year"].isna()
-    merged.loc[needs_fallback, "detection_year"] = merged.loc[needs_fallback, "fallback_year"]
-    merged.loc[needs_fallback, "detection_date"] = merged.loc[needs_fallback, "first_loss_date"]
-    merged.loc[needs_fallback, "detection_source"] = "fallback_first_loss"
-    merged["detection_year"] = merged["detection_year"].astype("Int64")
-    return merged.loc[:, [GROUP_ID, "detection_date", "detection_year", "detection_source"]]
-
-
-def classify_group_relevance(
-    summary: pd.DataFrame,
-    *,
-    alive_year_shift: int = 0,
-) -> pd.DataFrame:
-    """Определяет класс релевантности группы относительно года обнаружения.
-
-    Args:
-        summary: сводка по группам (см. :func:`build_group_summary`).
-        alive_year_shift: на сколько лет после обнаружения группа должна
-            «доживать», чтобы считаться действующей (0 = достаточно года
-            обнаружения).
-
-    Returns:
-        Копия сводки с колонкой ``group_relevance``.
-
-    Классы:
-        * ``Продолжает действовать`` — активность группы продолжается в год
-          обнаружения и позже, то есть без вмешательства сервиса убытки шли бы
-          и дальше;
-        * ``Распалась после обнаружения`` — группа жила до обнаружения, но
-          последний убыток приходится на год обнаружения (момент, когда сервис
-          мог её «поймать»);
-        * ``Распалась самостоятельно`` — группа перестала появляться **до** года
-          обнаружения, эффект от сервиса по ней нулевой: убытки прекратились
-          сами.
-
-    Note:
-        В исходной тетради класс присваивался построчно, и после этого строки
-        «Распалась самостоятельно» с вероятностью 0.5 превращались в
-        «Распалась после обнаружения» через ``np.random.choice`` — то есть часть
-        эффекта создавалась генератором случайных чисел. Здесь случайности нет.
+        Копия сводки с колонкой ``group_relevance``. Группы без стадии отбрасываются.
     """
     frame = summary.copy()
-    detection = pd.to_numeric(frame["detection_year"], errors="coerce")
-    last_year = pd.to_numeric(frame["last_loss_year"], errors="coerce")
-    shift = int(alive_year_shift)
+    if frame.empty:
+        frame["group_relevance"] = pd.Series(dtype="object")
+        return frame
 
-    # ``alive``: группа активна минимум через ``shift + 1`` год после обнаружения —
-    # значит, без вмешательства сервиса убытки шли бы и дальше.
-    # ``died_after``: последний убыток приходится ровно на год обнаружения
-    # (с учётом требуемого запаса лет) — группа «закрыта» сервисом.
-    # Остальное: ``died_before`` — убытки прекратились до обнаружения.
-    alive_condition = last_year > (detection + shift)
-    died_after_condition = last_year == (detection + shift)
+    if "card_stage" in frame.columns:
+        frame["group_relevance"] = frame["card_stage"].map(
+            lambda value: value if value in RELEVANCE_LABELS else normalize_card_stage(value)
+        )
+    else:
+        frame["group_relevance"] = pd.NA
 
-    conditions = [alive_condition, died_after_condition]
-    choices = [RELEVANCE_ALIVE, RELEVANCE_DIED_AFTER]
-    frame["group_relevance"] = np.select(conditions, choices, default=RELEVANCE_DIED_BEFORE)
+    unknown = frame["group_relevance"].isna() | ~frame["group_relevance"].isin(RELEVANCE_LABELS)
+    if unknown.any():
+        LOGGER.warning(
+            "У %d групп нет стадии УПС («в работе»/«закрыта») — отброшены",
+            int(unknown.sum()),
+        )
+        frame = frame.loc[~unknown].copy()
 
-    unexpected = ~frame["group_relevance"].isin(RELEVANCE_LABELS)
-    if unexpected.any():  # pragma: no cover - защита от новых значений
-        LOGGER.warning("Неожиданные классы релевантности: %s", frame.loc[unexpected].head())
-    return frame
+    return frame.reset_index(drop=True)
 
 
 def filter_groups_by_size(

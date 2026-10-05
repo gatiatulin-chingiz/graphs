@@ -156,12 +156,12 @@ def test_pipeline_persist_artifacts(tmp_path, synthetic, monkeypatch) -> None:
     monkeypatch.setattr(pipeline_module, "ARTIFACT_LOSS_FACTS", tmp_path / "loss_facts.parquet")
     monkeypatch.setattr(pipeline_module, "ARTIFACT_GROUP_SUMMARY", tmp_path / "summary.parquet")
     monkeypatch.setattr(pipeline_module, "ARTIFACT_EFFECT", tmp_path / "effect.parquet")
-    monkeypatch.setattr(pipeline_module, "ARTIFACT_BENEFICIARIES", tmp_path / "beneficiaries.pkl")
+    monkeypatch.setattr(pipeline_module, "ARTIFACT_BENEFICIARIES", tmp_path / "beneficiaries.parquet")
 
     run_pipeline(synthetic.beneficiaries, synthetic.losses, synthetic.cards, TEST_PARAMS, persist=True)
     assert (tmp_path / "loss_facts.parquet").exists()
     assert (tmp_path / "effect.parquet").exists()
-    assert (tmp_path / "beneficiaries.pkl").exists()
+    assert (tmp_path / "beneficiaries.parquet").exists()
 
 
 def test_pipeline_small_dataset_does_not_crash(tmp_path) -> None:

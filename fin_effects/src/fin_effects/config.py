@@ -67,8 +67,9 @@ def _env(*keys: str, default: str = "") -> str:
 load_dotenv()
 
 #: Имена промежуточных артефактов (pkl/parquet).
-ARTIFACT_BENEFICIARIES = INTERIM_DIR / "df_beneficiaries.pkl"
-ARTIFACT_LOSSES = INTERIM_DIR / "losses.pkl"
+ARTIFACT_BENEFICIARIES = INTERIM_DIR / "beneficiaries.parquet"
+ARTIFACT_LOSSES = INTERIM_DIR / "losses.parquet"
+ARTIFACT_CARDS = INTERIM_DIR / "cards.parquet"
 ARTIFACT_LOSS_FACTS = INTERIM_DIR / "loss_facts.parquet"
 ARTIFACT_GROUP_SUMMARY = INTERIM_DIR / "group_summary.parquet"
 ARTIFACT_EFFECT = INTERIM_DIR / "financial_effect.parquet"
@@ -128,15 +129,19 @@ class EffectParams:
 
 DEFAULT_PARAMS = EffectParams()
 
-#: Метки классов релевантности группы (используются и в отчётах).
-RELEVANCE_ALIVE = "Продолжает действовать"
-RELEVANCE_DIED_AFTER = "Распалась после обнаружения"
-RELEVANCE_DIED_BEFORE = "Распалась самостоятельно"
+#: Метки статуса группы по карточке УПС (используются и в отчётах).
+RELEVANCE_IN_PROGRESS = "Группа в работе"
+RELEVANCE_CLOSED = "Группа закрыта"
 
-RELEVANCE_LABELS = (RELEVANCE_ALIVE, RELEVANCE_DIED_AFTER, RELEVANCE_DIED_BEFORE)
+RELEVANCE_LABELS = (RELEVANCE_IN_PROGRESS, RELEVANCE_CLOSED)
 
-#: Классы, по которым сервис даёт эффект (группа «жива» на момент обнаружения).
-RELEVANT_CLASSES = (RELEVANCE_ALIVE, RELEVANCE_DIED_AFTER)
+#: Классы, по которым сервис даёт эффект (есть карточка УПС).
+RELEVANT_CLASSES = RELEVANCE_LABELS
+
+#: Устаревшие алиасы (для совместимости импортов в старых скриптах).
+RELEVANCE_ALIVE = RELEVANCE_IN_PROGRESS
+RELEVANCE_DIED_AFTER = RELEVANCE_CLOSED
+RELEVANCE_DIED_BEFORE = "Распалась самостоятельно"  # больше не используется в расчёте
 
 
 # ---------------------------------------------------------------------------
@@ -164,9 +169,8 @@ VSK_PALETTE = (
 
 #: Цвета классов релевантности в графиках/отчётах.
 VSK_RELEVANCE_COLORS = {
-    RELEVANCE_ALIVE: VSK_BLUE,
-    RELEVANCE_DIED_AFTER: VSK_ACCENT,
-    RELEVANCE_DIED_BEFORE: VSK_MUTED,
+    RELEVANCE_IN_PROGRESS: VSK_BLUE,
+    RELEVANCE_CLOSED: VSK_ACCENT,
 }
 
 

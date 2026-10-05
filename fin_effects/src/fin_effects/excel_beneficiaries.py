@@ -346,7 +346,7 @@ def load_beneficiaries(
     paths: Iterable[str | Path],
     *,
     engine: str = "openpyxl",
-    workers: int = 1,
+    workers: int | None = None,
     group_by_file: bool = True,
 ) -> tuple[pd.DataFrame, BeneficiaryLoadStats]:
     """Читает все выгрузки сервиса в одну таблицу.
@@ -354,7 +354,7 @@ def load_beneficiaries(
     Args:
         paths: пути к файлам (см. :func:`discover_workbooks`).
         engine: движок чтения Excel.
-        workers: число процессов; ``1`` — последовательно.
+        workers: число процессов; ``None`` — :data:`EXCEL_WORKERS`; ``1`` — последовательно.
         group_by_file: ``True`` — группа определяется файлом (листы одного файла —
             одна группа, как в исходной выгрузке «один файл = одна группа»);
             ``False`` — группа определяется листом.
@@ -366,7 +366,8 @@ def load_beneficiaries(
     if not path_list:
         return _empty_beneficiaries(), BeneficiaryLoadStats()
 
-    results = _read_all(path_list, engine=engine, workers=workers)
+    worker_count = EXCEL_WORKERS if workers is None else max(1, int(workers))
+    results = _read_all(path_list, engine=engine, workers=worker_count)
 
     frames = [frame for frame, _ in results if not frame.empty]
     combined = pd.concat(frames, ignore_index=True) if frames else _empty_beneficiaries()
@@ -481,6 +482,9 @@ def summarize_groups(frame: pd.DataFrame) -> pd.DataFrame:
 def load_beneficiaries_from_dir(
     root: str | Path,
     years: Iterable[str | int] = (),
+    *,
+    refresh: bool = False,
+    cache_path: str | Path | None = None,
     **kwargs,
 ) -> tuple[pd.DataFrame, BeneficiaryLoadStats]:
     """Находит и читает выгрузки в каталоге.
@@ -488,12 +492,45 @@ def load_beneficiaries_from_dir(
     Args:
         root: корневой каталог выгрузки.
         years: подкаталоги-годы.
+        refresh: ``True`` — игнорировать кэш и перечитать Excel.
+        cache_path: если задан — читать/писать parquet-кэш (для ноутбука
+            обычно ``ARTIFACT_BENEFICIARIES``); ``None`` — без кэша.
         **kwargs: пробрасывается в :func:`load_beneficiaries`.
 
     Returns:
         Кортеж «таблица участников, статистика».
     """
-    return load_beneficiaries(discover_workbooks(root, years), **kwargs)
+    if cache_path is not None:
+        path = Path(cache_path)
+        if path.exists() and not refresh:
+            LOGGER.info("Участники групп из кэша: %s", path)
+            frame = pd.read_parquet(path)
+            stats = BeneficiaryLoadStats(
+                files=int(frame["source_file"].nunique()) if "source_file" in frame.columns else 0,
+                rows=len(frame),
+                sheets_ok=int(frame["source_sheet"].nunique())
+                if "source_sheet" in frame.columns
+                else 0,
+                loss_numbers=int(frame["loss_number"].astype(bool).sum())
+                if "loss_number" in frame.columns
+                else 0,
+                person_keys=int(frame["person_key"].astype(bool).sum())
+                if "person_key" in frame.columns
+                else 0,
+            )
+            return frame, stats
+
+    frame, stats = load_beneficiaries(discover_workbooks(root, years), **kwargs)
+
+    if cache_path is not None and not frame.empty:
+        path = Path(cache_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        to_save = frame.copy()
+        if "birth_date" in to_save.columns:
+            to_save["birth_date"] = pd.to_datetime(to_save["birth_date"], errors="coerce")
+        to_save.to_parquet(path, index=False)
+        LOGGER.info("Кэш участников сохранён: %s (%d строк)", path, len(to_save))
+    return frame, stats
 
 
 def _glob_legacy(root: str | Path, years: Iterable[str | int] = ()) -> list[str]:

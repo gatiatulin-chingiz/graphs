@@ -133,6 +133,7 @@ def benchmark_pipeline(rows: int, groups: int) -> list[Measurement]:
         groups=groups,
         noise_losses=max(0, rows - groups * 20),
         output_dir=PROJECT_ROOT / "data" / "benchmark",
+        write_workbooks=False,
     )
     data = generate_synthetic_data(data_config)
     losses = data.losses

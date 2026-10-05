@@ -180,5 +180,25 @@ def test_attach_unions_person_key_and_loss_number(synthetic) -> None:
         }
     )
     combined = pd.concat([synthetic.beneficiaries, extra], ignore_index=True)
-    _, paired = attach_groups_to_losses(facts, combined)
+    _, paired = attach_groups_to_losses(facts, combined, match_mode="union")
     assert "extra_by_loss" in set(paired["group_id"])
+
+
+def test_attach_auto_skips_person_key_when_loss_numbers_present(synthetic) -> None:
+    """В auto при номерах убытков в Excel не тянем все убытки участника из КАСКО."""
+    normalized = normalize_losses(synthetic.losses)
+    facts, _ = collapse_losses_to_facts(normalized)
+    sample = facts.head(5).copy()
+    beneficiaries = pd.DataFrame(
+        {
+            "group_id": ["g1"] * 5,
+            "person_key": synthetic.beneficiaries["person_key"].head(5).tolist(),
+            "loss_number": sample["LossNumber"].tolist(),
+            "full_name": [""] * 5,
+            "birth_date": [pd.NaT] * 5,
+        }
+    )
+    _, via_union = attach_groups_to_losses(facts, beneficiaries, match_mode="union")
+    _, via_auto = attach_groups_to_losses(facts, beneficiaries, match_mode="auto")
+    assert len(via_auto) <= len(via_union)
+    assert via_auto["LossNumber"].nunique() == 5

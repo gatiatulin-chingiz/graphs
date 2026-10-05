@@ -2,6 +2,22 @@
 
 ## 2026-10-05
 
+- Что: классы групп — «в работе» / «закрыта» по стадии карточки УПС; без карточки группа вне эффекта; карточка по 1 убытку расширяется на всю группу через ФИО+ДР.
+- Зачем: одна карточка ≠ один убыток; эффект только по группам, которыми реально занимаются.
+- Проверка: `python scripts/build_html_report.py` → `outputs/reports/financial_effect.html`.
+
+- Что: prod-матч убытков к группам: при `loss_number` в Excel — только по номеру (без union с ФИО); компактный ноутбук + `write_html_report` в ячейке; KPI `pipeline_overview_table`.
+- Зачем: union с `person_key` тянул сотни тысяч убытков КАСКО → млрд эффекта; HTML не вызывался из ноутбука.
+- Проверка: перезапуск прод-ноутбука — пары «убыток–группа» сильно меньше; `outputs/reports/financial_effect.html`.
+
+- Что: ускорение: prod Excel (`iter_rows`, быстрый цвет, стоп на пустых); кэш `beneficiaries.parquet`; `EXCEL_WORKERS` по умолчанию; synth `write_workbooks=False` в скриптах/ноутбуке (без сотен xlsx).
+- Зачем: повторные прогоны не должны минутами читать 100+ xlsx/SQL и писать синтетические книги.
+- Проверка: `run_synthetic` / HTML без xlsx; prod — `REFRESH_EXCEL/SQL=True` один раз, дальше parquet.
+
+- Что: `load_losses` / `load_cards` читают parquet-кэш (`data/interim/losses.parquet`, `cards.parquet`), SQL — только при отсутствии файла или `refresh=True`.
+- Зачем: не тянуть ~1.5M строк losses из OISUU на каждый прогон ноутбука.
+- Проверка: первый `load_losses()` пишет кэш; второй — из parquet без SQL.
+
 - Что: prod-парсер Excel (`excel_loss_groups`): листы с колонкой «Убыток» (нормализация заголовков), цветные строки (заливка/шрифт), 1 файл = 1 группа; матч убытков по `loss_number` + `person_key`.
 - Зачем: боевые выгрузки — широкие таблицы убытков, а не 3 колонки ФИО/ДР; старый парсер почти ничего не матчил.
 - Проверка: `pytest tests/test_excel_loss_groups.py`; на сервере `SYNTHETIC=False` — рост «Пар убыток-группа».

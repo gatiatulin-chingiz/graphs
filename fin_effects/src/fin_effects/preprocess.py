@@ -270,11 +270,23 @@ def attach_groups_by_loss_number(
     return membership.loc[:, [LOSS_KEY, "group_id", "matched_members"]]
 
 
+def _beneficiaries_have_loss_numbers(beneficiaries: pd.DataFrame) -> bool:
+    """Есть ли в выгрузке сервиса номера убытков (prod Excel с колонкой «Убыток»)."""
+    if beneficiaries.empty or "loss_number" not in beneficiaries.columns:
+        return False
+    series = beneficiaries["loss_number"]
+    if series.empty:
+        return False
+    text = normalize_series(series.astype("object"))
+    return bool(text.astype(bool).any())
+
+
 def attach_groups_to_losses(
     facts: pd.DataFrame,
     beneficiaries: pd.DataFrame,
     *,
     min_members_matched: int = 1,
+    match_mode: str = "auto",
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Сопоставляет убытки с группами сервиса по участникам и/или номеру убытка.
 
@@ -283,6 +295,9 @@ def attach_groups_to_losses(
         beneficiaries: таблица участников.
         min_members_matched: сколько участников группы должно встречаться в
             убытке, чтобы убыток считался «групповым» (для матча по person_key).
+        match_mode: ``auto`` — только ``loss_number``, если он есть в Excel
+            (prod); иначе ``person_key``. ``union`` — объединять оба способа
+            (legacy + доп. номера). ``loss_number`` / ``person_key`` — явно.
 
     Returns:
         Кортеж:
@@ -294,21 +309,33 @@ def attach_groups_to_losses(
 
     Note:
         Prod-выгрузки содержат ``loss_number`` — прямой матч с ``LossNumber``.
-        Параллельно остаётся join по ``person_key``. Результаты объединяются
-        (union), дубликаты пар ``LossNumber``+``group_id`` схлопываются.
+        Join по ``person_key`` подтягивает **все** убытки участника из КАСКО и
+        раздувает базу; в ``auto`` при наличии ``loss_number`` он не используется.
     """
+    if match_mode not in {"auto", "loss_number", "person_key", "union"}:
+        raise ValueError("match_mode: auto | loss_number | person_key | union")
+
     if beneficiaries.empty or facts.empty:
         return _empty_pairs(facts), _empty_pairs(facts)
 
     membership_parts: list[pd.DataFrame] = []
+    use_loss = match_mode in {"auto", "loss_number", "union"}
+    use_person = match_mode in {"person_key", "union"}
+    if match_mode == "auto":
+        has_loss_numbers = _beneficiaries_have_loss_numbers(beneficiaries)
+        use_loss = has_loss_numbers
+        use_person = not has_loss_numbers
 
-    by_loss = attach_groups_by_loss_number(facts, beneficiaries)
-    if not by_loss.empty:
-        membership_parts.append(by_loss)
+    by_loss = pd.DataFrame(columns=[LOSS_KEY, "group_id", "matched_members"])
+    if use_loss:
+        by_loss = attach_groups_by_loss_number(facts, beneficiaries)
+        if not by_loss.empty:
+            membership_parts.append(by_loss)
 
     keys = [column for column in BENEFICIARY_KEY_COLUMNS if column in facts.columns]
     has_person = (
-        "person_key" in beneficiaries.columns
+        use_person
+        and "person_key" in beneficiaries.columns
         and beneficiaries["person_key"].astype(bool).any()
     )
     if keys and has_person:
@@ -349,14 +376,20 @@ def attach_groups_to_losses(
     )
 
     facts_with_groups = facts.merge(membership, on=LOSS_KEY, how="inner")
+    by_person_pairs = 0
+    if use_person and not by_loss.empty:
+        loss_keys = set(by_loss[LOSS_KEY])
+        by_person_pairs = int((~membership[LOSS_KEY].isin(loss_keys)).sum())
+    elif use_person:
+        by_person_pairs = len(membership)
     LOGGER.info(
-        "Убытков сопоставлено с группами: %d из %d (пар убыток-группа: %d; "
-        "по номеру: %d, по person_key: %d)",
+        "Сопоставление (%s): убытков %d из %d; пар %d (по номеру: %d, по ФИО: %d)",
+        match_mode,
         facts_with_groups[LOSS_KEY].nunique(),
         facts[LOSS_KEY].nunique(),
         len(facts_with_groups),
         len(by_loss) if not by_loss.empty else 0,
-        len(membership) - (len(by_loss) if not by_loss.empty else 0),
+        by_person_pairs,
     )
     return membership, facts_with_groups
 

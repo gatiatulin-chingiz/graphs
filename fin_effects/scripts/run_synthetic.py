@@ -94,7 +94,12 @@ def main() -> int:
     _configure_logging(args.verbose)
 
     started = time.perf_counter()
-    config = SynthConfig(groups=args.groups, noise_losses=args.noise, seed=args.seed)
+    config = SynthConfig(
+        groups=args.groups,
+        noise_losses=args.noise,
+        seed=args.seed,
+        write_workbooks=False,
+    )
     data = generate_synthetic_data(config)
     print(data.summary())
     generation_time = time.perf_counter() - started

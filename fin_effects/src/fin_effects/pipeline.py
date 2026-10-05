@@ -42,7 +42,7 @@ from .groups import (
     filter_observation_period,
     year_matrix,
 )
-from .io_utils import cache_frame, write_pickle
+from .io_utils import cache_frame
 from .preprocess import (
     LossPreprocessStats,
     add_group_number_column,
@@ -122,10 +122,16 @@ class PipelineResult:
             else {}
         )
         # «руб.» вместо «₽»: на Windows консоль cp1251 падает на символе рубля.
+        unique_matched = (
+            self.facts_with_groups["LossNumber"].nunique()
+            if not self.facts_with_groups.empty
+            else 0
+        )
         return "\n".join(
             [
                 f"Групп в выгрузке сервиса: {groups}",
                 f"Убытков (фактов): {len(self.loss_facts)}",
+                f"Убытков привязано к группам (уник.): {unique_matched}",
                 f"Пар убыток-группа: {len(self.facts_with_groups)}",
                 f"Групп после фильтров: {len(self.summary)}",
                 f"Классы: {classes}",
@@ -142,6 +148,7 @@ def run_pipeline(
     *,
     persist: bool = False,
     min_members_matched: int = 1,
+    match_mode: str = "auto",
 ) -> PipelineResult:
     """Прогоняет полный расчёт финансового эффекта.
 
@@ -152,6 +159,7 @@ def run_pipeline(
         params: параметры методики.
         persist: сохранять ли промежуточные артефакты в ``data/interim``.
         min_members_matched: сколько участников группы должно быть в убытке.
+        match_mode: см. :func:`~fin_effects.preprocess.attach_groups_to_losses`.
 
     Returns:
         :class:`PipelineResult`.
@@ -170,12 +178,21 @@ def run_pipeline(
     loss_facts, dropped_by_year = filter_observation_period(loss_facts, params)
 
     membership, facts_with_groups = attach_groups_to_losses(
-        loss_facts, beneficiaries, min_members_matched=min_members_matched
+        loss_facts,
+        beneficiaries,
+        min_members_matched=min_members_matched,
+        match_mode=match_mode,
     )
     del membership
     facts_with_groups = add_group_number_column(facts_with_groups, beneficiaries, GROUP_NUMBER_COLUMN)
 
-    summary, group_stats = build_group_summary(facts_with_groups, cards, params)
+    summary, group_stats = build_group_summary(
+        facts_with_groups,
+        cards,
+        params,
+        loss_facts=loss_facts,
+        beneficiaries=beneficiaries,
+    )
     summary, dropped_short = filter_groups_by_size(summary, params)
     summary = classify_group_relevance(summary)
     group_stats = GroupBuildStats(
@@ -234,7 +251,7 @@ def persist_artifacts(result: PipelineResult) -> dict[str, Path]:
         Словарь «имя артефакта -> путь».
     """
     paths = {
-        "beneficiaries": write_pickle(result.beneficiaries, ARTIFACT_BENEFICIARIES),
+        "beneficiaries": cache_frame(result.beneficiaries, ARTIFACT_BENEFICIARIES),
         "loss_facts": cache_frame(result.loss_facts, ARTIFACT_LOSS_FACTS),
         "group_summary": cache_frame(result.summary, ARTIFACT_GROUP_SUMMARY),
         "group_effect": cache_frame(result.group_effect, ARTIFACT_EFFECT),
