@@ -6,6 +6,7 @@ import shutil
 import datetime
 from itertools import combinations
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -244,7 +245,7 @@ def run_pipeline(*, draw: bool = False):
         load()
         log('2/3  Построение связей', level='step')
         create_links()
-        log('3/3  Статистика → ./output/statistics.xlsx', level='step')
+        log('3/3  Статистика → ./output/statistics.xlsx + statistics_losses.parquet', level='step')
         create_statistics()
         _save_fingerprint(fingerprint)
     else:
@@ -785,7 +786,16 @@ def create_statistics():
 
     with pd.ExcelWriter('./output/statistics.xlsx', engine='xlsxwriter') as writer:
         stat.to_excel(writer, index=False, sheet_name='statistics')
-    log(f'big_groups: {len(big_groups)}  →  ./output/statistics.xlsx', level='info')
+
+    # Исходные убытки + все поля statistics.xlsx напротив каждой строки.
+    losses_parquet = Path('./output/statistics_losses.parquet')
+    data.merge(stat, on='Группа', how='left').to_parquet(
+        losses_parquet, index=False, engine='pyarrow'
+    )
+    log(
+        f'big_groups: {len(big_groups)}  →  ./output/statistics.xlsx, {losses_parquet}',
+        level='info',
+    )
     
     
 def load_statistics():
