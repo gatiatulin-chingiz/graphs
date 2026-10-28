@@ -1,0 +1,15 @@
+# Скопируйте в .env и заполните. Реальные секреты сюда не коммитьте.
+
+OISUU_CONN_HOST=oisuu-db-biz.vsk.ru
+OISUU_CONN_USERNAME=
+OISUU_CONN_PASSWORD=
+OISUU_CONN_DATABASE=OISUU_report
+
+# Опционально: имя ODBC-драйвера или путь к libmsodbcsql*.so
+# OISUU_ODBC_DRIVER=ODBC Driver 18 for SQL Server
+# OISUU_ODBC_DRIVER=/usr/lib64/libmsodbcsql-18.so
+
+ACTUAR_CONN_HOST=actuar2.vsk.ru
+ACTUAR_CONN_USERNAME=
+ACTUAR_CONN_PASSWORD=
+ACTUAR_CONN_DATABASE=Motor

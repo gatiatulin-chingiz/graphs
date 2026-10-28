@@ -244,7 +244,7 @@ def run_pipeline(*, draw: bool = False):
     ensure_artifact_dirs()
     cached, fingerprint = try_load_cached_artifacts()
     if not cached:
-        log('1/3  Загрузка и предобработка Excel', level='step')
+        log('1/3  Загрузка и предобработка (Excel и/или SQL)', level='step')
         load()
         log('2/3  Построение связей', level='step')
         create_links()
@@ -310,20 +310,86 @@ def load():
     choice_query()
 
 
-def choice_query():
-    global data
-    onlyfiles = [
+def _list_excel_files() -> list[str]:
+    """xlsx/xls в рабочей папке."""
+    return sorted(
         f for f in os.listdir(os.getcwd())
-        if os.path.isfile(os.path.join(os.getcwd(), f)) and f.lower().endswith(('.xlsx', '.xls'))
-    ]
-    if not onlyfiles:
-        raise FileNotFoundError('В рабочей папке нет xlsx/xls-файлов')
-    log(f'Excel: {", ".join(onlyfiles)}', level='info')
-    max_workers = min(4, len(onlyfiles))
-    with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        frames = list(pool.map(pd.read_excel, onlyfiles))
+        if os.path.isfile(os.path.join(os.getcwd(), f))
+        and f.lower().endswith(('.xlsx', '.xls'))
+    )
+
+
+def _list_sql_files() -> list[str]:
+    """sql-файлы в рабочей папке (например «Пример SQL.sql»)."""
+    return sorted(
+        f for f in os.listdir(os.getcwd())
+        if os.path.isfile(os.path.join(os.getcwd(), f))
+        and f.lower().endswith('.sql')
+    )
+
+
+def _strip_sql_comments(text: str) -> str:
+    """Убирает /* … */ и -- комментарии из текста запроса."""
+    without_block = re.sub(r'/\*.*?\*/', '', text, flags=re.S)
+    lines = []
+    for line in without_block.splitlines():
+        if '--' in line:
+            line = line[: line.index('--')]
+        lines.append(line)
+    return '\n'.join(lines).strip()
+
+
+def load_sql_file(path: str | Path) -> pd.DataFrame:
+    """Выполняет SQL-файл против OISUU и возвращает DataFrame.
+
+    Args:
+        path: путь к ``.sql`` (обычно ``Пример SQL.sql``).
+
+    Returns:
+        Результат SELECT.
+    """
+    from .connections import connect_oisuu
+
+    sql_path = Path(path)
+    query = _strip_sql_comments(sql_path.read_text(encoding='utf-8'))
+    if not query:
+        raise ValueError(f'Пустой SQL после очистки комментариев: {sql_path}')
+    log(f'SQL → OISUU: {sql_path.name}', level='info')
+    connection = connect_oisuu()
+    try:
+        frame = pd.read_sql_query(query, connection)
+    finally:
+        connection.close()
+    log(f'SQL строк: {len(frame):,}', level='info')
+    return frame
+
+
+def choice_query():
+    """Собирает ``data`` из Excel и/или SQL в рабочей папке."""
+    global data
+    frames: list[pd.DataFrame] = []
+
+    excel_files = _list_excel_files()
+    if excel_files:
+        log(f'Excel: {", ".join(excel_files)}', level='info')
+        max_workers = min(4, len(excel_files))
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            frames.extend(pool.map(pd.read_excel, excel_files))
+
+    sql_files = _list_sql_files()
+    if sql_files:
+        log(f'SQL-файлы: {", ".join(sql_files)}', level='info')
+        for name in sql_files:
+            frames.append(load_sql_file(Path(os.getcwd()) / name))
+
+    if not frames:
+        raise FileNotFoundError(
+            'В рабочей папке нет источников данных: нужен .xlsx/.xls и/или .sql '
+            '(например «Пример SQL.sql» + .env с OISUU_CONN_*)'
+        )
+
     data = pd.concat(frames, axis=0, ignore_index=True)
-    log(f'строк: {len(data):,}', level='info')
+    log(f'строк всего: {len(data):,}', level='info')
     preprocessing()
 
 # Препроцессинг

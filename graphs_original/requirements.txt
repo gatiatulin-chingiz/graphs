@@ -6,3 +6,4 @@ xlsxwriter
 pyarrow
 python-dotenv
 ipykernel
+pyodbc
