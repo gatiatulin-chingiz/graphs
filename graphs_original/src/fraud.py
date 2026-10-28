@@ -16,6 +16,7 @@ from . import config
 from .main import (
     GEPHI_DIR,
     HTML_DIR,
+    OUTPUT_DIR,
     bound,
     ensure_artifact_dirs,
     ensure_runtime_state,
@@ -24,6 +25,15 @@ from .main import (
     _clean_entity_label,
     _hub_keywords,
     _node_label,
+)
+
+LOSSES_PARQUET = os.path.join(OUTPUT_DIR, 'statistics_losses.parquet')
+_FRAUD_LOSS_COLS = (
+    'fraud_тип',
+    'fraud_score',
+    'fraud_cluster_id',
+    'битк',
+    'fraud_bitki_jaccard',
 )
 
 
@@ -885,6 +895,126 @@ def show_quick_slices():
     return slices
 
 
+def _clusters_for_loss_typing(ranked: pd.DataFrame | None, bundle: dict | None) -> pd.DataFrame:
+    """Кластеры с типом для привязки к убыткам.
+
+    Витрина ``ranked`` режет по ``bound`` и отбрасывает «фоновую мелочь».
+    Для parquet берём все кластеры bundle с ≥3 узлами (иначе на синтетике
+    и мелких seed-кластерах колонки остаются пустыми).
+    """
+    if ranked is not None and not ranked.empty:
+        return ranked.reset_index(drop=True)
+
+    if not bundle or not bundle.get('clusters'):
+        return pd.DataFrame()
+
+    people_count = _people_count()
+    rows = []
+    for cl in bundle['clusters']:
+        nodes = set(cl.get('nodes') or [])
+        if len(nodes) < 3:
+            continue
+        feats = score_cluster(bundle['graph'], nodes, people_count, bundle=bundle)
+        ctype = classify_case_type(feats)
+        rows.append({
+            'cluster_id': cl['cluster_id'],
+            'kind': cl.get('kind'),
+            'тип': ctype,
+            'score': feats['score'],
+            'size': feats['size'],
+            'bitki_jaccard': feats['bitki_jaccard_max'],
+            'nodes': list(nodes),
+        })
+    if not rows:
+        return pd.DataFrame()
+    frame = pd.DataFrame(rows)
+    frame['_prio'] = frame['тип'].map(lambda t: _TYPE_PRIORITY.get(t, 5))
+    return (
+        frame.sort_values(['_prio', 'score'], ascending=[True, False])
+        .drop(columns='_prio')
+        .reset_index(drop=True)
+    )
+
+
+def attach_fraud_types_to_losses(
+    ranked: pd.DataFrame,
+    bundle: dict | None = None,
+    path: str | None = None,
+) -> pd.DataFrame:
+    """Пишет в ``statistics_losses.parquet`` тип fraud-кейса по каждому убытку.
+
+    Колонки: ``fraud_тип``, ``fraud_score``, ``fraud_cluster_id``, ``битк``,
+    ``fraud_bitki_jaccard``. Если убыток в нескольких кластерах — берётся
+    кластер с большим ``score``. Колонки создаются всегда (даже если типов нет).
+    """
+    from . import main as m
+
+    target = path or LOSSES_PARQUET
+    if not os.path.isfile(target):
+        log(f'нет {target} — fraud-типы к убыткам не записаны', level='warn')
+        return pd.DataFrame()
+
+    losses = pd.read_parquet(target)
+    losses = losses.drop(columns=list(_FRAUD_LOSS_COLS), errors='ignore')
+    for col in _FRAUD_LOSS_COLS:
+        losses[col] = pd.NA
+    losses['битк'] = False
+
+    id_col = getattr(m, 'ID_col', 'Убыток')
+    data = getattr(m, 'data', None)
+    typed_clusters = _clusters_for_loss_typing(ranked, bundle)
+    if data is None or id_col not in data.columns or typed_clusters.empty:
+        losses.to_parquet(target, index=False)
+        log('fraud-типы: нет кластеров для привязки (колонки созданы пустыми)', level='info')
+        return losses
+
+    rows = []
+    for _, cl in typed_clusters.iterrows():
+        nodes = set(cl.get('nodes') or [])
+        if not nodes:
+            continue
+        sub = _cluster_sublinks(nodes, bundle)
+        if sub.empty or 'Loss_idx' not in sub.columns:
+            continue
+        loss_ids = pd.to_numeric(sub['Loss_idx'], errors='coerce').dropna().astype(int)
+        loss_ids = loss_ids[loss_ids.isin(data.index)]
+        if loss_ids.empty:
+            continue
+        numbers = data.loc[loss_ids, id_col]
+        ctype = str(cl.get('тип', ''))
+        for loss_number in pd.unique(numbers.dropna()):
+            rows.append({
+                id_col: loss_number,
+                'fraud_тип': ctype,
+                'fraud_score': float(cl.get('score', 0) or 0),
+                'fraud_cluster_id': cl.get('cluster_id'),
+                'битк': ctype == 'кольцо битов',
+                'fraud_bitki_jaccard': float(cl.get('bitki_jaccard', 0) or 0),
+            })
+
+    if not rows:
+        losses.to_parquet(target, index=False)
+        log('fraud-типы: убытки к кластерам не сопоставились', level='info')
+        return losses
+
+    assign = (
+        pd.DataFrame(rows)
+        .sort_values('fraud_score', ascending=False)
+        .drop_duplicates(subset=[id_col], keep='first')
+    )
+    losses = losses.drop(columns=list(_FRAUD_LOSS_COLS), errors='ignore')
+    losses = losses.merge(assign, on=id_col, how='left')
+    losses['битк'] = losses['битк'].fillna(False).astype(bool)
+    losses.to_parquet(target, index=False)
+    typed = int(losses['fraud_тип'].notna().sum())
+    bitki = int(losses['битк'].sum())
+    log(
+        f'fraud-типы → {target}: убытков с типом {typed}, битков {bitki}',
+        level='ok',
+    )
+    return losses
+
+
 def show_fraud_candidates(group_index: int = 0, top_n_per_type=None,
                           *, with_slices: bool = False):
     """Отчёт: Top-N по score внутри каждого типа. Срезы — with_slices=True."""
@@ -896,6 +1026,7 @@ def show_fraud_candidates(group_index: int = 0, top_n_per_type=None,
     display(Markdown('### Кластеры-кандидаты (fraud): Top-N по score внутри типа'))
     bundle = build_fraud_clusters(group_index)
     ranked = evaluate_fraud_clusters(bundle)
+    attach_fraud_types_to_losses(ranked, bundle)
     view = select_fraud_top(ranked, top_n_per_type)
     ncfg = _resolve_top_n_per_type(top_n_per_type)
     display(Markdown(f'`fraud_top_n_per_type` = `{ncfg}` · всего в витрине: **{len(view)}**'))

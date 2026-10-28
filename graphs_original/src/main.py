@@ -108,6 +108,9 @@ REQUIRED_ARTIFACTS = (
     'data', 'people', 'VIN', 'objects', 'columns',
     'links', 'G', 'groups', 'stat',
 )
+# Снимок убытков сразу после загрузки, до правок preprocessing.
+source_data = None
+_EXPORT_ROW_ID = '_export_row_id'
 
 
 def clear_graph_outputs():
@@ -325,7 +328,7 @@ def choice_query():
 
 # Препроцессинг
 def preprocessing():
-    global data, people, VIN, objects
+    global data, people, VIN, objects, source_data
     global ID_col, FIO_cul_col, BD_cul_col, FIO_vic_col, BD_vic_col, FIO_pol_col, BD_pol_col
     global FIO_cul_obj_own_col, BD_cul_obj_own_col, FIO_vic_obj_own_col, BD_vic_obj_own_col, FIO_pol_obj_own_col, BD_pol_obj_own_col
     global FIO_pol_driv_col, BD_pol_driv_col, FIO_ref_rec, BD_ref_rec
@@ -371,7 +374,11 @@ def preprocessing():
             error = 1
     if error == 1:
         return -1
-    
+
+    # Все колонки выгрузки как пришли из SQL/Excel, до upper/дат/фильтров.
+    data[_EXPORT_ROW_ID] = np.arange(len(data))
+    source_data = data.copy()
+
     # Удаление дубликатов
     data[ID_col] = data[ID_col].astype(int)
     temp = data[[ID_col]].duplicated().mean()
@@ -787,11 +794,26 @@ def create_statistics():
     with pd.ExcelWriter('./output/statistics.xlsx', engine='xlsxwriter') as writer:
         stat.to_excel(writer, index=False, sheet_name='statistics')
 
-    # Исходные убытки + все поля statistics.xlsx напротив каждой строки.
+    # Исходные колонки загрузки (SQL/Excel) + поля statistics.xlsx на каждый убыток.
     losses_parquet = Path('./output/statistics_losses.parquet')
-    data.merge(stat, on='Группа', how='left').to_parquet(
-        losses_parquet, index=False, engine='pyarrow'
-    )
+    if (
+        source_data is not None
+        and _EXPORT_ROW_ID in getattr(source_data, 'columns', [])
+        and _EXPORT_ROW_ID in data.columns
+    ):
+        export = source_data.merge(
+            data.loc[:, [_EXPORT_ROW_ID, 'Группа']],
+            on=_EXPORT_ROW_ID,
+            how='left',
+        ).drop(columns=[_EXPORT_ROW_ID])
+    else:
+        export = data.drop(columns=[_EXPORT_ROW_ID], errors='ignore')
+    # На уровне убытка не дублируем длинные списки группы.
+    drop_from_losses = ['ФИО участников группы', 'Номера убытков']
+    stat_for_losses = stat.drop(columns=drop_from_losses, errors='ignore')
+    losses_frame = export.merge(stat_for_losses, on='Группа', how='left')
+    losses_frame = losses_frame.drop(columns=drop_from_losses, errors='ignore')
+    losses_frame.to_parquet(losses_parquet, index=False, engine='pyarrow')
     log(
         f'big_groups: {len(big_groups)}  →  ./output/statistics.xlsx, {losses_parquet}',
         level='info',
