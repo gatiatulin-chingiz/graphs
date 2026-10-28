@@ -2,6 +2,10 @@
 
 ## 2026-10-29
 
+- Что: ODBC — поиск реальных `libmsodbcsql*.so` на диске (как в monitoring/fin_effects), без жёстких несуществующих путей; алиасы `OISUU_UID`/`OISUU_PWD`.
+- Зачем: на Jupyter «ODBC Driver 18» в odbcinst часто указывает на отсутствующий `.so` → `file not found`.
+- Проверка: `run_pipeline()` с `.sql`; при ошибке смотреть `libmsodbcsql on disk` в сообщении и при необходимости задать `OISUU_ODBC_DRIVER`.
+
 - Что: `choice_query` читает Excel и/или выполняет `.sql` из рабочей папки (в т.ч. `Пример SQL.sql`) через OISUU/pyodbc; `env_template` для логина.
 - Зачем: на сервере без xlsx пайплайн поднимается прямой выгрузкой из БД.
 - Проверка: положить `Пример SQL.sql` + `.env` из `env_template` → `run_pipeline()` без xlsx; или Excel + SQL вместе.
